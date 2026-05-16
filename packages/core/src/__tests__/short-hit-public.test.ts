@@ -11,6 +11,7 @@ import {
 import { saveSecrets } from "../llm/secrets.js";
 import {
   extractGeminiImageBase64,
+  extractImagesGenerationImage,
   resolveCoverGenerationRequest,
 } from "../pipeline/short-fiction-runner.js";
 
@@ -158,7 +159,7 @@ describe("public short-hit chain", () => {
       });
 
       await expect(resolveCoverGenerationRequest({ root })).resolves.toMatchObject({
-        api: "responses",
+        api: "images",
         baseUrl: "https://api.kkaiapi.com/v1",
         model: "gpt-image-2",
         apiKey: "sk-cover",
@@ -166,6 +167,16 @@ describe("public short-hit chain", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("extracts OpenAI-compatible image generation URLs and base64 payloads", () => {
+    expect(extractImagesGenerationImage({
+      data: [{ url: "https://api.kkaiapi.com/files/img_abc123.png" }],
+    })).toEqual({ url: "https://api.kkaiapi.com/files/img_abc123.png" });
+
+    expect(extractImagesGenerationImage({
+      data: [{ b64_json: "ZmFrZQ==" }],
+    })).toEqual({ base64: "ZmFrZQ==", extension: "png" });
   });
 
   it("extracts Gemini inline image data from generateContent responses", () => {

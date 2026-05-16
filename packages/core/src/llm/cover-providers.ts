@@ -4,7 +4,7 @@ export interface CoverProviderPreset {
   readonly service: CoverProviderId;
   readonly label: string;
   readonly baseUrl: string;
-  readonly api: "responses" | "gemini";
+  readonly api: "responses" | "images" | "gemini";
   readonly defaultModel: string;
   readonly models: readonly string[];
 }
@@ -14,7 +14,7 @@ export const COVER_PROVIDER_PRESETS: readonly CoverProviderPreset[] = [
     service: "kkaiapi",
     label: "kkaiapi",
     baseUrl: "https://api.kkaiapi.com/v1",
-    api: "responses",
+    api: "images",
     defaultModel: "gpt-image-2",
     models: ["gpt-image-2"],
   },
@@ -22,7 +22,7 @@ export const COVER_PROVIDER_PRESETS: readonly CoverProviderPreset[] = [
     service: "openai",
     label: "OpenAI Images",
     baseUrl: "https://api.openai.com/v1",
-    api: "responses",
+    api: "images",
     defaultModel: "gpt-image-2",
     models: ["gpt-image-2"],
   },

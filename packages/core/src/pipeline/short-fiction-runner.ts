@@ -271,6 +271,14 @@ async function generateCoverArtifact(input: {
     return { coverImagePath: coverPath };
   }
 
+  if (request.api === "images") {
+    const prompt = buildCoverImagePrompt(input.salesPackage);
+    const payload = await generateImagesCover(request, prompt, size);
+    const coverPath = join(input.baseDir, "final", payload.extension === "jpg" ? "cover.jpg" : "cover.png");
+    await writeBinary(input.root, coverPath, payload.buffer);
+    return { coverImagePath: coverPath };
+  }
+
   const endpoint = request.endpoint ?? `${request.baseUrl.replace(/\/+$/u, "")}/responses`;
   const response = await fetch(endpoint, {
     method: "POST",
@@ -323,9 +331,11 @@ export async function resolveCoverGenerationRequest(input: {
 }): Promise<ShortFictionCoverRequest> {
   if (input.coverEndpoint || input.coverBaseUrl || process.env.INKOS_COVER_ENDPOINT || process.env.INKOS_COVER_BASE_URL) {
     const endpoint = resolveCoverEndpoint(input.coverEndpoint, input.coverBaseUrl);
-    const baseUrl = input.coverBaseUrl || process.env.INKOS_COVER_BASE_URL || endpoint.replace(/\/responses\/?$/u, "");
+    const baseUrl = input.coverBaseUrl || process.env.INKOS_COVER_BASE_URL || endpoint
+      .replace(/\/responses\/?$/u, "")
+      .replace(/\/images\/generations\/?$/u, "");
     return {
-      api: "responses",
+      api: endpoint.includes("/responses") ? "responses" : "images",
       baseUrl,
       endpoint,
       model: input.coverModel || process.env.INKOS_COVER_MODEL || "gpt-image-2",
@@ -378,6 +388,95 @@ async function resolveProjectCoverApiKey(root: string, service: string): Promise
     || secrets.services[service]?.apiKey
     || process.env[`${service.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase()}_API_KEY`]
     || "";
+}
+
+async function generateImagesCover(
+  request: ShortFictionCoverRequest,
+  prompt: string,
+  size: string,
+): Promise<{ readonly buffer: Buffer; readonly extension: "png" | "jpg" }> {
+  const endpoint = request.endpoint ?? `${request.baseUrl.replace(/\/+$/u, "")}/images/generations`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${request.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: request.model,
+      prompt,
+      n: 1,
+      size,
+    }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`cover generation failed: HTTP ${response.status} ${text.slice(0, 500)}`);
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`cover generation returned non-JSON response: ${String(error)}`);
+  }
+
+  const image = extractImagesGenerationImage(payload);
+  if (image?.base64) {
+    return {
+      buffer: Buffer.from(image.base64, "base64"),
+      extension: image.extension,
+    };
+  }
+  if (image?.url) {
+    return downloadGeneratedCoverImage(image.url, request.apiKey);
+  }
+  throw new Error("cover generation response did not include image URL or base64 data.");
+}
+
+export function extractImagesGenerationImage(payload: unknown): (
+  | { readonly base64: string; readonly extension: "png" | "jpg"; readonly url?: undefined }
+  | { readonly url: string; readonly base64?: undefined; readonly extension?: undefined }
+) | undefined {
+  const data = (payload as { data?: unknown }).data;
+  if (!Array.isArray(data)) return undefined;
+
+  for (const item of data) {
+    const record = item as { b64_json?: unknown; url?: unknown };
+    if (typeof record.b64_json === "string" && record.b64_json.trim()) {
+      return { base64: record.b64_json.trim(), extension: "png" };
+    }
+    if (typeof record.url === "string" && record.url.trim()) {
+      return { url: record.url.trim() };
+    }
+  }
+
+  return undefined;
+}
+
+async function downloadGeneratedCoverImage(
+  url: string,
+  apiKey: string,
+): Promise<{ readonly buffer: Buffer; readonly extension: "png" | "jpg" }> {
+  const response = await fetch(url);
+  const fallbackResponse = response.status === 401 || response.status === 403
+    ? await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` } })
+    : response;
+  if (!fallbackResponse.ok) {
+    const text = await fallbackResponse.text();
+    throw new Error(`cover image download failed: HTTP ${fallbackResponse.status} ${text.slice(0, 300)}`);
+  }
+  const contentType = fallbackResponse.headers.get("content-type") ?? "";
+  const buffer = Buffer.from(await fallbackResponse.arrayBuffer());
+  return {
+    buffer,
+    extension: coverImageExtension(contentType, url),
+  };
+}
+
+function coverImageExtension(contentType: string, url: string): "png" | "jpg" {
+  const normalized = `${contentType} ${url}`.toLowerCase();
+  return normalized.includes("jpeg") || normalized.includes(".jpg") || normalized.includes(".jpeg") ? "jpg" : "png";
 }
 
 async function generateGeminiCover(
@@ -471,7 +570,7 @@ function resolveCoverEndpoint(coverEndpoint?: string, coverBaseUrl?: string): st
   if (!baseUrl) {
     throw new Error("cover endpoint is required. Set INKOS_COVER_BASE_URL or disable cover generation.");
   }
-  return `${baseUrl.replace(/\/+$/u, "")}/responses`;
+  return `${baseUrl.replace(/\/+$/u, "")}/images/generations`;
 }
 
 function buildCoverImagePrompt(salesPackage: ShortHitSalesPackage): string {
