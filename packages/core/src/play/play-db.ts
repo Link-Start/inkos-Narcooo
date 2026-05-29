@@ -20,13 +20,13 @@ import type { PlayGraphSnapshot } from "./play-file-db.js";
 const require = createRequire(import.meta.url);
 
 const ENTITY_SELECT_COLUMNS = `
-  id,
-  type,
-  label,
-  summary,
-  status,
-  created_event AS createdEventId,
-  updated_event AS updatedEventId
+  entities.id,
+  entities.type,
+  entities.label,
+  entities.summary,
+  entities.status,
+  entities.created_event AS createdEventId,
+  entities.updated_event AS updatedEventId
 `;
 
 const EDGE_SELECT_COLUMNS = `
