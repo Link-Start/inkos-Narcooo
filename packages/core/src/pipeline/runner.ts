@@ -2160,13 +2160,13 @@ export class PipelineRunner {
     const storyDir = join(bookDir, "story");
     await mkdir(storyDir, { recursive: true });
 
-    // Statistical fingerprint
-    const profile = analyzeStyle(sample, sourceName);
-    await writeFile(join(storyDir, "style_profile.json"), JSON.stringify(profile, null, 2), "utf-8");
-
     const book = await this.state.loadBookConfig(bookId);
     const { profile: gp } = await this.loadGenreProfile(book.genre);
     const lang = (book.language ?? gp.language) === "en" ? "en" as const : "zh" as const;
+
+    // Statistical fingerprint (language-aware: words for en, characters for zh)
+    const profile = analyzeStyle(sample, sourceName, lang);
+    await writeFile(join(storyDir, "style_profile.json"), JSON.stringify(profile, null, 2), "utf-8");
 
     let qualitativeGuide: string;
     if (sample.length < 500) {
@@ -2178,11 +2178,37 @@ export class PipelineRunner {
       });
     } else {
       try {
-        // LLM qualitative extraction
-        const response = await chatCompletion(this.config.client, this.config.model, [
-          {
-            role: "system",
-            content: `你是一位文学风格分析专家。分析参考文本的写作风格，提取可供模仿的定性特征。
+        // LLM qualitative extraction (language-aware prompt)
+        const styleSystemPrompt = lang === "en"
+          ? `You are a literary style analyst. Analyze the writing style of the reference text and extract qualitative, imitable features.
+
+Output format (Markdown):
+## Narrative Voice & Tone
+(detached / fervent / ironic / warm / ..., with 1-2 quoted lines from the text)
+
+## Dialogue Style
+(shared traits in how characters speak: sentence length, verbal tics, dialect markers, dialogue rhythm)
+
+## Scene Description
+(sensory preferences, choice of imagery, description density, how setting ties to emotion)
+
+## Transitions & Connective Technique
+(how scenes switch, how time jumps are handled, paragraph-to-paragraph transitions)
+
+## Pacing
+(distribution of long vs short sentences, paragraph-length preference, how climaxes and lulls alternate)
+
+## Diction
+(signature high-frequency word choices, figurative/rhetorical tendencies, degree of colloquialism)
+
+## Emotional Expression
+(direct lyricism vs externalized action, frequency and style of interior monologue)
+
+## Distinctive Habits
+(any personal writing habits worth imitating)
+
+Base the analysis on the text's actual features, not generalities. Support each section with 1-2 quoted lines from the original.`
+          : `你是一位文学风格分析专家。分析参考文本的写作风格，提取可供模仿的定性特征。
 
 输出格式（Markdown）：
 ## 叙事声音与语气
@@ -2209,12 +2235,13 @@ export class PipelineRunner {
 ## 独特习惯
 （任何值得模仿的个人写作习惯）
 
-分析必须基于原文实际特征，不要泛泛而谈。每个部分用1-2个原文例句佐证。`,
-          },
-          {
-            role: "user",
-            content: `分析以下参考文本的写作风格：\n\n${sample.slice(0, 20000)}`,
-          },
+分析必须基于原文实际特征，不要泛泛而谈。每个部分用1-2个原文例句佐证。`;
+        const styleUserPrompt = lang === "en"
+          ? `Analyze the writing style of the following reference text:\n\n${sample.slice(0, 20000)}`
+          : `分析以下参考文本的写作风格：\n\n${sample.slice(0, 20000)}`;
+        const response = await chatCompletion(this.config.client, this.config.model, [
+          { role: "system", content: styleSystemPrompt },
+          { role: "user", content: styleUserPrompt },
         ], { temperature: 0.3 });
         qualitativeGuide = response.content.trim()
           ? response.content
