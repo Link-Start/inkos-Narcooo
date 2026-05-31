@@ -64,6 +64,7 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     PipelineRunner: MockPipelineRunner,
     Scheduler: MockScheduler,
     isNewLayoutBook,
+    tryParseBookRulesFrontmatter: actual.tryParseBookRulesFrontmatter,
     createLLMClient: vi.fn(() => ({})),
     createLogger: vi.fn(() => logger),
     computeAnalytics: vi.fn(() => ({})),

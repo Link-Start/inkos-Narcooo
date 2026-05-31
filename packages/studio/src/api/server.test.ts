@@ -240,6 +240,7 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     appendBookSessionMessage: appendBookSessionMessageMock,
     appendManualSessionMessages: appendManualSessionMessagesMock,
     isNewLayoutBook: vi.fn(async () => false),
+    tryParseBookRulesFrontmatter: actual.tryParseBookRulesFrontmatter,
     renameBookSession: renameBookSessionMock,
     deleteBookSession: deleteBookSessionMock,
     migrateBookSession: migrateBookSessionMock,

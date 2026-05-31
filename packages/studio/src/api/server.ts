@@ -1720,12 +1720,19 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     // can warn users their edits won't reach the runtime.
     // Hotfix: only tag as legacy when the book actually HAS the new layout.
     // Pre-Phase-5 books use story_bible/book_rules as the authoritative source.
-    const { isNewLayoutBook } = await import("@actalk/inkos-core");
+    const { isNewLayoutBook, tryParseBookRulesFrontmatter } = await import("@actalk/inkos-core");
     const legacy = LEGACY_SHIM_FILES.has(file) && await isNewLayoutBook(bookDir);
 
     try {
       const content = await readFile(resolved, "utf-8");
-      return c.json({ file, content, ...(legacy ? { legacy: true } : {}) });
+      // Files like outline/story_frame.md carry a YAML frontmatter block of
+      // structured fields (protagonist / genreLock / prohibitions / ...). Parse
+      // it here so the UI can render those as friendly cards instead of dumping
+      // raw YAML at the reader. `content` stays raw so the editor round-trips it
+      // unchanged; `body` is the prose with the frontmatter stripped.
+      const parsed = tryParseBookRulesFrontmatter(content);
+      const structured = parsed ? { frontmatter: parsed.rules, body: parsed.body } : {};
+      return c.json({ file, content, ...structured, ...(legacy ? { legacy: true } : {}) });
     } catch {
       return c.json({ file, content: null, ...(legacy ? { legacy: true } : {}) });
     }
