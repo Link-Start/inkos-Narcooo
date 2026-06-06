@@ -84,6 +84,10 @@ function isHoldingEdge(edge: PlayEdge): boolean {
   return edge.value?.role === "holding";
 }
 
+function isRelationEdge(edge: PlayEdge): boolean {
+  return edge.value?.role === "relation";
+}
+
 function isHeldEntity(entity: PlayEntity, currentEdges: ReadonlyArray<PlayEdge>): boolean {
   if (!HOLDING_TYPES.has(entity.type)) return false;
   return currentEdges.some((edge) =>
@@ -133,10 +137,15 @@ export function buildView(run: PlayRunResponse | null): HudView | null {
     if (summary === e.label || summary === e.status) return [];
     return [{ text: summary }];
   };
+  const statusNote = (e: PlayEntity): string | null => {
+    const status = e.status?.trim();
+    if (!status || status === e.label) return null;
+    return status;
+  };
   // All current relationships involving an entity, ids resolved to labels.
   const relationDetails = (id: string): HudDetail[] =>
     currentEdges
-      .filter((e) => e.fromId === id || e.toId === id)
+      .filter((e) => isRelationEdge(e) && (e.fromId === id || e.toId === id))
       .map((e) => {
         const other = e.fromId === id ? labelOf.get(e.toId) : labelOf.get(e.fromId);
         const strength = typeof e.strength === "number" ? ` ${e.strength}` : "";
@@ -145,14 +154,14 @@ export function buildView(run: PlayRunResponse | null): HudView | null {
 
   const locations: HudRow[] = entities
     .filter((e) => e.type === "location")
-    .map((e) => ({ id: e.id, glyph: "📍", label: e.label, note: e.status ?? null, details: summaryDetail(e) }));
+    .map((e) => ({ id: e.id, glyph: "📍", label: e.label, note: statusNote(e), details: summaryDetail(e) }));
   const actors: HudRow[] = entities
     .filter((e) => e.type === "actor")
     .map((e) => ({
       id: e.id,
       glyph: "👤",
       label: e.label,
-      note: e.status ?? null,
+      note: statusNote(e),
       details: [...summaryDetail(e), ...relationDetails(e.id)],
       imageUrl: e.imageUrl,
     }));
@@ -162,7 +171,7 @@ export function buildView(run: PlayRunResponse | null): HudView | null {
       id: e.id,
       glyph: HOLDING_GLYPH[e.type] ?? "•",
       label: e.label,
-      note: e.status ?? null,
+      note: statusNote(e),
       details: summaryDetail(e),
       imageUrl: e.imageUrl,
     }));
@@ -172,7 +181,7 @@ export function buildView(run: PlayRunResponse | null): HudView | null {
       id: e.id,
       glyph: HOLDING_GLYPH[e.type] ?? "•",
       label: e.label,
-      note: e.status ?? null,
+      note: statusNote(e),
       details: summaryDetail(e),
       imageUrl: e.imageUrl,
     }));
