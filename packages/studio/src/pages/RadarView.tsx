@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Theme } from "../hooks/use-theme";
 import type { TFunction } from "../hooks/use-i18n";
 import { useColors } from "../hooks/use-colors";
 import { fetchJson } from "../hooks/use-api";
-import { TrendingUp, Loader2, Target } from "lucide-react";
+import { TrendingUp, Loader2, Target, Clock } from "lucide-react";
 
 interface Recommendation {
   readonly confidence: number;
@@ -19,13 +19,34 @@ interface RadarResult {
   readonly recommendations: ReadonlyArray<Recommendation>;
 }
 
+interface RadarHistoryItem {
+  readonly file: string;
+  readonly timestamp: string;
+  readonly summaryPreview: string;
+  readonly result: RadarResult;
+}
+
 interface Nav { toDashboard: () => void }
 
 export function RadarView({ nav, theme, t }: { nav: Nav; theme: Theme; t: TFunction }) {
   const c = useColors(theme);
   const [result, setResult] = useState<RadarResult | null>(null);
+  const [history, setHistory] = useState<ReadonlyArray<RadarHistoryItem>>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  const loadHistory = async () => {
+    try {
+      const data = await fetchJson<{ items: ReadonlyArray<RadarHistoryItem> }>("/radar/history");
+      setHistory(data.items ?? []);
+    } catch {
+      setHistory([]);
+    }
+  };
+
+  useEffect(() => {
+    void loadHistory();
+  }, []);
 
   const handleScan = async () => {
     setLoading(true);
@@ -34,6 +55,7 @@ export function RadarView({ nav, theme, t }: { nav: Nav; theme: Theme; t: TFunct
     try {
       const data = await fetchJson<RadarResult>("/radar/scan", { method: "POST" });
       setResult(data);
+      await loadHistory();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -99,6 +121,27 @@ export function RadarView({ nav, theme, t }: { nav: Nav; theme: Theme; t: TFunct
                   </div>
                 )}
               </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {history.length > 0 && (
+        <div className={`border ${c.cardStatic} rounded-lg p-5 space-y-3`}>
+          <h3 className="text-xs font-bold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
+            <Clock size={14} />
+            {t("radar.history")}
+          </h3>
+          <div className="space-y-2">
+            {history.slice(0, 10).map((item) => (
+              <button
+                key={item.file}
+                onClick={() => setResult(item.result)}
+                className="w-full rounded-md border border-border/40 px-3 py-2 text-left text-xs hover:bg-muted/30"
+              >
+                <div className="font-medium text-foreground">{new Date(item.timestamp).toLocaleString()}</div>
+                <div className="mt-1 line-clamp-2 text-muted-foreground">{item.summaryPreview || item.file}</div>
+              </button>
             ))}
           </div>
         </div>

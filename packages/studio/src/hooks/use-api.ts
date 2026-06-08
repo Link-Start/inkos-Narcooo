@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
+import { localizeKnownRuntimeMessage } from "../lib/error-copy";
 
-const BASE = "/api";
+const BASE = "/api/v1";
 const API_INVALIDATE_EVENT = "inkos:api-invalidate";
 
 interface ApiInvalidateDetail {
@@ -20,30 +21,30 @@ export function deriveInvalidationPaths(path: string): ReadonlyArray<string> {
   const normalized = buildApiUrl(path);
   if (!normalized) return [];
 
-  if (normalized === "/api/books/create") {
-    return ["/api/books"];
+  if (normalized === "/api/v1/books/create") {
+    return ["/api/v1/books"];
   }
 
-  if (normalized === "/api/project") {
-    return ["/api/project"];
+  if (normalized === "/api/v1/project") {
+    return ["/api/v1/project"];
   }
 
-  if (normalized.startsWith("/api/project/")) {
-    return ["/api/project", normalized];
+  if (normalized.startsWith("/api/v1/project/")) {
+    return ["/api/v1/project", normalized];
   }
 
-  const bookAction = normalized.match(/^\/api\/books\/([^/]+)\/(write-next|draft)$/);
+  const bookAction = normalized.match(/^\/api\/v1\/books\/([^/]+)\/(write-next|draft)$/);
   if (bookAction) {
-    return ["/api/books", `/api/books/${bookAction[1]}`];
+    return ["/api/v1/books", `/api/v1/books/${bookAction[1]}`];
   }
 
-  const chapterAction = normalized.match(/^\/api\/books\/([^/]+)\/chapters\/\d+\/(approve|reject)$/);
+  const chapterAction = normalized.match(/^\/api\/v1\/books\/([^/]+)\/chapters\/\d+\/(approve|reject)$/);
   if (chapterAction) {
-    return ["/api/books", `/api/books/${chapterAction[1]}`];
+    return ["/api/v1/books", `/api/v1/books/${chapterAction[1]}`];
   }
 
-  if (/^\/api\/daemon\/(start|stop)$/.test(normalized)) {
-    return ["/api/daemon"];
+  if (/^\/api\/v1\/daemon\/(start|stop)$/.test(normalized)) {
+    return ["/api/v1/daemon"];
   }
 
   return [];
@@ -65,7 +66,7 @@ async function readErrorMessage(res: Response): Promise<string> {
     try {
       const json = await res.json() as { error?: unknown };
       if (typeof json.error === "string" && json.error.trim()) {
-        return json.error;
+        return localizeKnownRuntimeMessage(json.error);
       }
       if (
         json.error &&
@@ -74,13 +75,13 @@ async function readErrorMessage(res: Response): Promise<string> {
         typeof (json.error as { message?: unknown }).message === "string" &&
         (json.error as { message: string }).message.trim()
       ) {
-        return (json.error as { message: string }).message;
+        return localizeKnownRuntimeMessage((json.error as { message: string }).message);
       }
     } catch {
       // fall through
     }
   }
-  return `${res.status} ${res.statusText}`.trim();
+  return localizeKnownRuntimeMessage(`${res.status} ${res.statusText}`.trim());
 }
 
 export async function fetchJson<T>(
@@ -164,7 +165,7 @@ export function useApi<T>(path: string) {
     };
   }, [path, refetch]);
 
-  return { data, loading, error, refetch };
+  return { data, loading, error, refetch, mutate: setData };
 }
 
 export async function postApi<T>(path: string, body?: unknown): Promise<T> {

@@ -2,11 +2,94 @@ import { Command } from "commander";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { findProjectRoot, log, logError, GLOBAL_ENV_PATH } from "../utils.js";
+import { fetchWithProxy } from "@actalk/inkos-core";
 import {
   ensureNodeRuntimePinFiles,
   evaluateSqliteMemorySupport,
   inspectNodeRuntimePinFiles,
 } from "../runtime-requirements.js";
+
+function buildDoctorProbePlans(
+  preferredApiFormat: "chat" | "responses" | undefined,
+  preferredStream: boolean | undefined,
+): Array<{ apiFormat: "chat" | "responses"; stream: boolean }> {
+  const plans: Array<{ apiFormat: "chat" | "responses"; stream: boolean }> = [];
+  const seen = new Set<string>();
+  const push = (apiFormat: "chat" | "responses", stream: boolean) => {
+    const key = `${apiFormat}:${stream ? "1" : "0"}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    plans.push({ apiFormat, stream });
+  };
+
+  if (preferredApiFormat) {
+    push(preferredApiFormat, preferredStream ?? false);
+    push(preferredApiFormat, !(preferredStream ?? false));
+  }
+  const alternate = preferredApiFormat === "responses" ? "chat" : "responses";
+  push(alternate, false);
+  push(alternate, true);
+  push("chat", false);
+  push("chat", true);
+  push("responses", false);
+  push("responses", true);
+  return plans;
+}
+
+export function buildDoctorModelCandidates(
+  preferredModel: string | undefined,
+  discoveredModels: Array<{ id: string; name: string }>,
+): string[] {
+  const seen = new Set<string>();
+  const candidates: string[] = [];
+  const push = (value: string | undefined | null) => {
+    if (!value || value.trim().length === 0) return;
+    const model = value.trim();
+    if (seen.has(model)) return;
+    seen.add(model);
+    candidates.push(model);
+  };
+
+  push(preferredModel);
+  for (const model of discoveredModels) push(model.id);
+  push("gpt-5.4");
+  push("gpt-4o");
+  push("claude-sonnet-4-6");
+  push("MiniMax-M2.7");
+  push("kimi-k2.5");
+  push("gemini-2.5-flash");
+  return candidates;
+}
+
+export function resolveDoctorModelsBaseUrl(
+  service: string | undefined,
+  baseUrl: string,
+  resolveServiceModelsBaseUrl: (service: string) => string | undefined,
+): string {
+  if (!service || service.length === 0) {
+    return baseUrl;
+  }
+  return resolveServiceModelsBaseUrl(service) ?? baseUrl;
+}
+
+async function fetchDoctorModels(
+  modelsBaseUrl: string,
+  apiKey: string,
+  proxyUrl?: string,
+): Promise<Array<{ id: string; name: string }>> {
+  const modelsUrl = modelsBaseUrl.replace(/\/$/, "") + "/models";
+  try {
+    const res = await fetchWithProxy(modelsUrl, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(10_000),
+    }, proxyUrl);
+    if (!res.ok) return [];
+    const json = await res.json() as { data?: Array<{ id: string }> };
+    return (json.data ?? []).map((model) => ({ id: model.id, name: model.id }));
+  } catch {
+    return [];
+  }
+}
 
 export const doctorCommand = new Command("doctor")
   .description("Check environment and project health")
@@ -73,23 +156,27 @@ export const doctorCommand = new Command("doctor")
       });
     }
 
-    // 5. Check LLM API key (global + project .env)
+    // 5. Check effective LLM config (Studio project base + env/CLI overlay, or legacy env)
     {
-      const { loadConfig } = await import("../utils.js");
-      const { config: loadDotenv } = await import("dotenv");
-      loadDotenv({ path: GLOBAL_ENV_PATH });
-      loadDotenv({ path: join(root, ".env"), override: true });
+      const { loadConfigWithDiagnostics } = await import("../utils.js");
       const { isApiKeyOptionalForEndpoint } = await import("@actalk/inkos-core");
-      let provider = process.env.INKOS_LLM_PROVIDER;
-      let baseUrl = process.env.INKOS_LLM_BASE_URL;
+      let configResult: Awaited<ReturnType<typeof loadConfigWithDiagnostics>> | undefined;
       try {
-        const config = await loadConfig({ requireApiKey: false });
-        provider = config.llm.provider;
-        baseUrl = config.llm.baseUrl;
+        configResult = await loadConfigWithDiagnostics({ requireApiKey: false });
+        checks.push({
+          name: "LLM Config Mode",
+          ok: true,
+          detail: `${configResult.diagnostics.configMode} (service=${configResult.diagnostics.serviceSource}, model=${configResult.diagnostics.modelSource}, key=${configResult.diagnostics.apiKeySource})`,
+        });
+        for (const warning of configResult.diagnostics.warnings) {
+          checks.push({ name: "  Config Hint", ok: true, detail: warning });
+        }
       } catch {
-        // Fall back to raw env inspection only.
+        // The API connectivity check below will report the concrete config failure.
       }
-      const apiKey = process.env.INKOS_LLM_API_KEY;
+      const provider = configResult?.llm.provider;
+      const baseUrl = configResult?.llm.baseUrl;
+      const apiKey = configResult?.llm.apiKey;
       const apiKeyOptional = isApiKeyOptionalForEndpoint({ provider, baseUrl });
       const hasKey = apiKeyOptional || (!!apiKey && apiKey.length > 10 && apiKey !== "your-api-key-here");
       checks.push({
@@ -99,7 +186,7 @@ export const doctorCommand = new Command("doctor")
           ? "Optional for local/self-hosted endpoint"
           : hasKey
             ? "Configured"
-            : "Missing — run 'inkos config set-global' or add to project .env",
+            : "Missing — save a Studio service key or set env for CLI/daemon/deploy",
       });
     }
 
@@ -149,7 +236,7 @@ export const doctorCommand = new Command("doctor")
 
     // 6. API connectivity test
     try {
-      const { createLLMClient, chatCompletion, LLMConfigSchema, isApiKeyOptionalForEndpoint } = await import("@actalk/inkos-core");
+      const { createLLMClient, chatCompletion, LLMConfigSchema, isApiKeyOptionalForEndpoint, resolveServiceModelsBaseUrl } = await import("@actalk/inkos-core");
       const { loadConfig } = await import("../utils.js");
 
       let llmConfig;
@@ -181,6 +268,11 @@ export const doctorCommand = new Command("doctor")
           ok: false,
           detail: "No LLM config available (no project config or global .env)",
         });
+        checks.push({
+          name: "  Hint",
+          ok: false,
+          detail: "Run `inkos setup`, `inkos config set-global`, or add LLM settings to the project .env file.",
+        });
       } else {
         checks.push({
           name: "LLM Config",
@@ -188,17 +280,72 @@ export const doctorCommand = new Command("doctor")
           detail: `provider=${llmConfig.provider} model=${llmConfig.model} stream=${llmConfig.stream ?? true} baseUrl=${llmConfig.baseUrl}`,
         });
 
-        const client = createLLMClient(llmConfig);
         log("\n  [..] Testing API connectivity...");
-        const response = await chatCompletion(client, llmConfig.model, [
-          { role: "user", content: "Say OK" },
-        ], { maxTokens: 16 });
+
+        let connected = false;
+        let detectedDetail = "";
+        let lastError = "Unknown error";
+        const modelsBaseUrl = resolveDoctorModelsBaseUrl(
+          typeof llmConfig.service === "string" ? llmConfig.service : undefined,
+          llmConfig.baseUrl,
+          resolveServiceModelsBaseUrl,
+        );
+        const discoveredModels = (llmConfig.apiKey && modelsBaseUrl)
+          ? await fetchDoctorModels(modelsBaseUrl, llmConfig.apiKey, llmConfig.proxyUrl)
+          : [];
+        const modelCandidates = (llmConfig.provider === "openai" || discoveredModels.length > 0)
+          ? buildDoctorModelCandidates(llmConfig.model, discoveredModels)
+          : [llmConfig.model];
+        const plans = llmConfig.provider === "openai"
+          ? buildDoctorProbePlans(llmConfig.apiFormat, llmConfig.stream)
+          : [{ apiFormat: (llmConfig.apiFormat ?? "chat") as "chat" | "responses", stream: llmConfig.stream ?? true }];
+
+        for (const model of modelCandidates) {
+          for (const plan of plans) {
+            try {
+              const client = createLLMClient({
+                ...llmConfig,
+                model,
+                apiFormat: plan.apiFormat,
+                stream: plan.stream,
+              });
+              const response = await chatCompletion(client, model, [
+                { role: "user", content: "Say OK" },
+              ], { maxTokens: 16 });
+
+              connected = true;
+              detectedDetail = `OK (model: ${model}, apiFormat=${plan.apiFormat}, stream=${plan.stream}, tokens: ${response.usage.totalTokens})`;
+              break;
+            } catch (error) {
+              lastError = error instanceof Error ? error.message : String(error);
+            }
+          }
+          if (connected) {
+            break;
+          }
+        }
 
         checks.push({
           name: "API Connectivity",
-          ok: true,
-          detail: `OK (model: ${llmConfig.model}, tokens: ${response.usage.totalTokens})`,
+          ok: connected,
+          detail: connected ? detectedDetail : lastError.split("\n")[0]!,
         });
+
+        if (!connected && /\b(?:401|403|429)\b|unauthorized|forbidden|quota|额度|余额|配额/i.test(lastError)) {
+          checks.push({
+            name: "  Hint",
+            ok: false,
+            detail: "检查 API Key 是否正确、模型是否可用，以及账号余额或配额是否足够。",
+          });
+        }
+
+        if (!connected && llmConfig.provider === "openai") {
+          checks.push({
+            name: "  Hint",
+            ok: false,
+            detail: "当前已自动尝试 chat/responses 与流式开关组合；如果仍失败，问题更可能在模型名、baseUrl 路径或服务商兼容性本身。",
+          });
+        }
       }
     } catch (e) {
       const errMsg = String(e);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { filterEmotionalArcs, filterSummaries } from "../utils/context-filter.js";
+import { capContextBlock, filterEmotionalArcs, filterSummaries } from "../utils/context-filter.js";
 
 describe("context-filter", () => {
   it("filters old chapter summary rows even when titles start with 'Chapter'", () => {
@@ -37,5 +37,24 @@ describe("context-filter", () => {
     expect(filtered).not.toContain("| Lin Yue | 97 |");
     expect(filtered).toContain("| Lin Yue | 98 |");
     expect(filtered).toContain("| Lin Yue | 100 |");
+  });
+
+  it("caps oversized truth context while preserving beginning and latest tail", () => {
+    const longContext = [
+      "BEGIN-ANCHOR",
+      "中段旧设定。".repeat(2000),
+      "LATEST-TAIL",
+    ].join("\n");
+
+    const capped = capContextBlock(longContext, {
+      label: "story_bible",
+      maxChars: 1200,
+    });
+
+    expect(capped.length).toBeLessThanOrEqual(1200);
+    expect(capped).toContain("BEGIN-ANCHOR");
+    expect(capped).toContain("LATEST-TAIL");
+    expect(capped).toContain("InkOS context budget");
+    expect(capped).toContain("story_bible");
   });
 });

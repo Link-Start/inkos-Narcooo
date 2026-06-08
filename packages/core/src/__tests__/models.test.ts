@@ -4,6 +4,8 @@ import {
   PlatformSchema,
   GenreSchema,
   BookStatusSchema,
+  normalizePlatformId,
+  normalizePlatformOrOther,
 } from "../models/book.js";
 import { ChapterMetaSchema, ChapterStatusSchema } from "../models/chapter.js";
 import {
@@ -14,6 +16,7 @@ import {
 } from "../models/project.js";
 import {
   ChapterIntentSchema,
+  ChapterMemoSchema,
   ContextPackageSchema,
   RuleStackSchema,
   ChapterTraceSchema,
@@ -134,6 +137,18 @@ describe("PlatformSchema", () => {
 
   it("rejects unknown platform", () => {
     expect(() => PlatformSchema.parse("amazon")).toThrow();
+  });
+
+  it("normalizes platform ids and human-facing aliases", () => {
+    expect(normalizePlatformId("tomato")).toBe("tomato");
+    expect(normalizePlatformId("番茄小说")).toBe("tomato");
+    expect(normalizePlatformId("fanqie-novel")).toBe("tomato");
+    expect(normalizePlatformId("起点中文网")).toBe("qidian");
+    expect(normalizePlatformId("飞卢")).toBe("feilu");
+    expect(normalizePlatformId("royal-road")).toBe("other");
+    expect(normalizePlatformId("Kindle Unlimited")).toBe("other");
+    expect(normalizePlatformId("")).toBeUndefined();
+    expect(normalizePlatformOrOther("")).toBe("other");
   });
 });
 
@@ -335,6 +350,17 @@ describe("ProjectConfigSchema", () => {
     expect(result.daemon.maxChaptersPerDay).toBe(50);
   });
 
+  it("defaults long-form writing review retries to one and accepts project overrides", () => {
+    const defaults = ProjectConfigSchema.parse(validProject);
+    expect(defaults.writing.reviewRetries).toBe(1);
+
+    const overridden = ProjectConfigSchema.parse({
+      ...validProject,
+      writing: { reviewRetries: 3 },
+    });
+    expect(overridden.writing.reviewRetries).toBe(3);
+  });
+
   it("applies default empty notify array", () => {
     const withoutNotify = {
       name: "p1",
@@ -497,67 +523,17 @@ describe("ChapterIntentSchema", () => {
       chapter: 12,
       goal: "Pull focus back to the mentor conflict",
       outlineNode: "Volume 2 / Chapter 12",
-      sceneDirective: "Break the repeated investigation-room rhythm with a location change.",
-      arcDirective: "Advance toward the next concrete arc beat instead of replaying the fallback setup.",
-      moodDirective: "Release pressure for one chapter before the next escalation.",
-      titleDirective: "Avoid another ledger title and use a new concrete image.",
+      arcContext: "Volume arc: mentor confrontation, post-betrayal.",
       mustKeep: ["Protagonist remains injured"],
       mustAvoid: ["Do not reveal the mastermind"],
       styleEmphasis: ["dialogue tension", "character conflict"],
-      conflicts: [
-        {
-          type: "outline_vs_focus",
-          resolution: "allow local outline deferral",
-        },
-      ],
-      hookAgenda: {
-        pressureMap: [
-          {
-            hookId: "H019",
-            type: "relationship",
-            payoffTiming: "slow-burn",
-            phase: "middle",
-            pressure: "high",
-            movement: "partial-payoff",
-            reason: "stale-promise",
-            blockSiblingHooks: true,
-          },
-        ],
-        mustAdvance: ["H019"],
-        eligibleResolve: ["H045"],
-        staleDebt: ["H023", "H027"],
-        avoidNewHookFamilies: [
-          "anonymous-source-restatement",
-          "mechanism-restatement",
-        ],
-      },
     });
 
     expect(result.chapter).toBe(12);
     expect(result.goal).toContain("mentor conflict");
-    expect(result.sceneDirective).toContain("location change");
-    expect(result.arcDirective).toContain("arc beat");
-    expect(result.moodDirective).toContain("Release pressure");
-    expect(result.titleDirective).toContain("ledger title");
-    expect(result.conflicts).toHaveLength(1);
-    expect(result.hookAgenda.pressureMap).toEqual([
-      expect.objectContaining({
-        hookId: "H019",
-        type: "relationship",
-        phase: "middle",
-        movement: "partial-payoff",
-        pressure: "high",
-        payoffTiming: "slow-burn",
-        reason: "stale-promise",
-      }),
-    ]);
-    expect(result.hookAgenda.mustAdvance).toEqual(["H019"]);
-    expect(result.hookAgenda.eligibleResolve).toEqual(["H045"]);
-    expect(result.hookAgenda.staleDebt).toEqual(["H023", "H027"]);
-    expect(result.hookAgenda.avoidNewHookFamilies).toEqual([
-      "anonymous-source-restatement",
-      "mechanism-restatement",
-    ]);
+    expect(result.outlineNode).toBe("Volume 2 / Chapter 12");
+    expect(result.arcContext).toContain("Volume arc");
+    expect(result.mustKeep).toContain("Protagonist remains injured");
   });
 
   it("defaults optional arrays to empty", () => {
@@ -566,19 +542,11 @@ describe("ChapterIntentSchema", () => {
       goal: "Establish the protagonist's first setback",
     });
 
-    expect(result.sceneDirective).toBeUndefined();
-    expect(result.arcDirective).toBeUndefined();
-    expect(result.moodDirective).toBeUndefined();
-    expect(result.titleDirective).toBeUndefined();
+    expect(result.outlineNode).toBeUndefined();
+    expect(result.arcContext).toBeUndefined();
     expect(result.mustKeep).toEqual([]);
     expect(result.mustAvoid).toEqual([]);
     expect(result.styleEmphasis).toEqual([]);
-    expect(result.conflicts).toEqual([]);
-    expect(result.hookAgenda.pressureMap).toEqual([]);
-    expect(result.hookAgenda.mustAdvance).toEqual([]);
-    expect(result.hookAgenda.eligibleResolve).toEqual([]);
-    expect(result.hookAgenda.staleDebt).toEqual([]);
-    expect(result.hookAgenda.avoidNewHookFamilies).toEqual([]);
   });
 
   it("rejects invalid chapter numbers", () => {
@@ -586,6 +554,53 @@ describe("ChapterIntentSchema", () => {
       ChapterIntentSchema.parse({
         chapter: 0,
         goal: "Bad chapter",
+      }),
+    ).toThrow();
+  });
+});
+
+describe("ChapterMemoSchema", () => {
+  it("accepts a memo with prose body and threadRefs", () => {
+    const result = ChapterMemoSchema.parse({
+      chapter: 12,
+      goal: "把七号门被动过手脚钉成现场实证",
+      isGoldenOpening: true,
+      body: "## 当前任务\n主角进入七号门……\n## 不要做\n不要让对手降智。",
+      threadRefs: ["H019", "S004"],
+    });
+
+    expect(result.isGoldenOpening).toBe(true);
+    expect(result.body).toContain("当前任务");
+    expect(result.threadRefs).toEqual(["H019", "S004"]);
+  });
+
+  it("defaults isGoldenOpening and threadRefs when omitted", () => {
+    const result = ChapterMemoSchema.parse({
+      chapter: 3,
+      goal: "让主角做下第一次不可逆选择",
+      body: "## 当前任务\n主角落下决定。",
+    });
+
+    expect(result.isGoldenOpening).toBe(false);
+    expect(result.threadRefs).toEqual([]);
+  });
+
+  it("rejects goal longer than 50 chars", () => {
+    expect(() =>
+      ChapterMemoSchema.parse({
+        chapter: 1,
+        goal: "a".repeat(51),
+        body: "## 当前任务\nx",
+      }),
+    ).toThrow();
+  });
+
+  it("rejects empty body", () => {
+    expect(() =>
+      ChapterMemoSchema.parse({
+        chapter: 1,
+        goal: "xxx",
+        body: "",
       }),
     ).toThrow();
   });

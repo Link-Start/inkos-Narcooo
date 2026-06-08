@@ -37,6 +37,131 @@ describe("WriterAgent", () => {
     vi.restoreAllMocks();
   });
 
+  it("renders per-chapter user context in governed creative prompts", () => {
+    const agent = new WriterAgent({
+      client: {
+        provider: "openai",
+        apiFormat: "chat",
+        stream: false,
+        defaults: {
+          temperature: 0.7,
+          maxTokens: 4096,
+          thinkingBudget: 0,
+          extra: {},
+        },
+      },
+      model: "test-model",
+      projectRoot: "/tmp/inkos-writer-context-test",
+    });
+
+    const prompt = (agent as unknown as {
+      buildGovernedUserPrompt(params: {
+        readonly chapterNumber: number;
+        readonly chapterMemo: {
+          readonly chapter: number;
+          readonly goal: string;
+          readonly isGoldenOpening: boolean;
+          readonly body: string;
+          readonly threadRefs: readonly string[];
+        };
+        readonly contextPackage: { readonly chapter: number; readonly selectedContext: readonly [] };
+        readonly ruleStack: {
+          readonly layers: readonly [];
+          readonly sections: { readonly hard: readonly string[]; readonly soft: readonly string[]; readonly diagnostic: readonly string[] };
+          readonly overrideEdges: readonly [];
+          readonly activeOverrides: readonly [];
+        };
+        readonly lengthSpec: ReturnType<typeof buildLengthSpec>;
+        readonly language?: "zh" | "en";
+        readonly externalContext?: string;
+      }): string;
+    }).buildGovernedUserPrompt({
+      chapterNumber: 7,
+      chapterMemo: {
+        chapter: 7,
+        goal: "推进账本线",
+        isGoldenOpening: false,
+        body: "## 当前任务\n围绕账本线推进。",
+        threadRefs: [],
+      },
+      contextPackage: { chapter: 7, selectedContext: [] },
+      ruleStack: {
+        layers: [],
+        sections: { hard: [], soft: [], diagnostic: [] },
+        overrideEdges: [],
+        activeOverrides: [],
+      },
+      lengthSpec: buildLengthSpec(1200, "zh"),
+      language: "zh",
+      externalContext: "本章标题：雨夜账本\n必须围绕账本失窃后的当面对质展开。",
+    });
+
+    expect(prompt).toContain("本章用户指令");
+    expect(prompt).toContain("本章标题：雨夜账本");
+    expect(prompt).toContain("当面对质");
+  });
+
+  it("caps oversized legacy truth files in creative prompts", () => {
+    const agent = new WriterAgent({
+      client: {
+        provider: "openai",
+        apiFormat: "chat",
+        stream: false,
+        defaults: {
+          temperature: 0.7,
+          maxTokens: 4096,
+          thinkingBudget: 0,
+          extra: {},
+        },
+      },
+      model: "test-model",
+      projectRoot: "/tmp/inkos-writer-context-budget-test",
+    });
+    const oversizedStoryBible = [
+      "BEGIN-STORY",
+      "旧设定。".repeat(4000),
+      "MIDDLE-MARKER",
+      "近期设定。".repeat(4000),
+      "LATEST-STORY",
+    ].join("\n");
+
+    const prompt = (agent as unknown as {
+      buildUserPrompt(params: {
+        readonly chapterNumber: number;
+        readonly storyBible: string;
+        readonly currentState: string;
+        readonly ledger: string;
+        readonly hooks: string;
+        readonly recentChapters: string;
+        readonly lengthSpec: ReturnType<typeof buildLengthSpec>;
+        readonly chapterSummaries: string;
+        readonly subplotBoard: string;
+        readonly emotionalArcs: string;
+        readonly characterMatrix: string;
+        readonly language?: "zh" | "en";
+      }): string;
+    }).buildUserPrompt({
+      chapterNumber: 88,
+      storyBible: oversizedStoryBible,
+      currentState: "(文件尚未创建)",
+      ledger: "",
+      hooks: "(文件尚未创建)",
+      recentChapters: "",
+      lengthSpec: buildLengthSpec(1200, "zh"),
+      chapterSummaries: "(文件尚未创建)",
+      subplotBoard: "(文件尚未创建)",
+      emotionalArcs: "(文件尚未创建)",
+      characterMatrix: "(文件尚未创建)",
+      language: "zh",
+    });
+
+    expect(prompt).toContain("BEGIN-STORY");
+    expect(prompt).toContain("LATEST-STORY");
+    expect(prompt).toContain("InkOS context budget");
+    expect(prompt).toContain("story_bible");
+    expect(prompt).not.toContain("MIDDLE-MARKER");
+  });
+
   it("uses compact summary context plus selected long-range evidence during governed settlement", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-writer-test-"));
     const bookDir = join(root, "book");
@@ -101,7 +226,7 @@ describe("WriterAgent", () => {
         defaults: {
           temperature: 0.7,
           maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
           extra: {},
         },
       },
@@ -231,7 +356,7 @@ describe("WriterAgent", () => {
       expect(settlePrompt).toContain("| 99 | Locked Gate |");
       expect(settlePrompt).toContain("## Hook Debt Briefs");
       expect(settlePrompt).toContain("mentor-oath | cadence: slow-burn");
-      expect(settlePrompt).toContain("| stale-ledger | 14 | mystery | open | 70 | 120 | 中程 | Old ledger debt is dormant but unresolved |");
+      expect(settlePrompt).toContain("| stale-ledger | 14 | mystery | open | 70 | 120 | 中程 | 无 |  | 否 |  |  | Old ledger debt is dormant but unresolved |");
       expect(settlePrompt).not.toContain("| 1 | Guild Trail |");
       expect(settlePrompt).not.toContain("old-seal");
       expect(settlePrompt).not.toContain("Guildmaster Ren");
@@ -289,7 +414,7 @@ describe("WriterAgent", () => {
         defaults: {
           temperature: 0.7,
           maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
           extra: {},
         },
       },
@@ -438,7 +563,7 @@ describe("WriterAgent", () => {
         defaults: {
           temperature: 0.7,
           maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
           extra: {},
         },
       },
@@ -587,7 +712,7 @@ describe("WriterAgent", () => {
         defaults: {
           temperature: 0.7,
           maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
           extra: {},
         },
       },
@@ -712,7 +837,7 @@ describe("WriterAgent", () => {
         defaults: {
           temperature: 0.7,
           maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
           extra: {},
         },
       },
@@ -833,7 +958,7 @@ describe("WriterAgent", () => {
         defaults: {
           temperature: 0.7,
           maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
           extra: {},
         },
       },
@@ -901,7 +1026,13 @@ describe("WriterAgent", () => {
         },
         bookDir,
         chapterNumber: 4,
-        chapterIntent: "# Chapter Intent\n\n## Goal\nForce Mara back toward the ledger trail.\n",
+        chapterMemo: {
+          chapter: 4,
+          goal: "Force Mara back toward the ledger trail.",
+          isGoldenOpening: false,
+          body: "",
+          threadRefs: ["ledger-fragment"],
+        },
         contextPackage: {
           chapter: 4,
           selectedContext: [
@@ -957,7 +1088,7 @@ describe("WriterAgent", () => {
         defaults: {
           temperature: 0.7,
           maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
           extra: {},
         },
       },
@@ -1025,7 +1156,13 @@ describe("WriterAgent", () => {
         },
         bookDir,
         chapterNumber: 4,
-        chapterIntent: "# Chapter Intent\n\n## Goal\nPush Mara back toward the archive ledger.\n",
+        chapterMemo: {
+          chapter: 4,
+          goal: "Push Mara back toward the archive ledger.",
+          isGoldenOpening: false,
+          body: "",
+          threadRefs: ["ledger-fragment"],
+        },
         contextPackage: {
           chapter: 4,
           selectedContext: [
@@ -1077,7 +1214,7 @@ describe("WriterAgent", () => {
     }
   });
 
-  it("renders an explicit hook agenda block and removes placeholder hook ids from the governed write contract", async () => {
+  it("sanitizes governed control inputs so raw hook ids and control headings do not enter the creative prompt", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-writer-hook-agenda-test-"));
     const bookDir = join(root, "book");
     const storyDir = join(bookDir, "story");
@@ -1100,7 +1237,7 @@ describe("WriterAgent", () => {
         defaults: {
           temperature: 0.7,
           maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
           extra: {},
         },
       },
@@ -1168,25 +1305,13 @@ describe("WriterAgent", () => {
         },
         bookDir,
         chapterNumber: 4,
-        chapterIntent: [
-          "# Chapter Intent",
-          "",
-          "## Goal",
-          "Push Mara back toward the archive ledger.",
-          "",
-          "## Hook Agenda",
-          "### Must Advance",
-          "- mentor-oath",
-          "",
-          "### Eligible Resolve",
-          "- ledger-fragment",
-          "",
-          "### Stale Debt",
-          "- stale-ledger",
-          "",
-          "### Avoid New Hook Families",
-          "- relationship",
-        ].join("\n"),
+        chapterMemo: {
+          chapter: 4,
+          goal: "Push Mara back toward the archive ledger.",
+          isGoldenOpening: false,
+          body: "本章要做的是推进 ledger-fragment tension at the archive.",
+          threadRefs: ["mentor-oath", "ledger-fragment"],
+        },
         contextPackage: {
           chapter: 4,
           selectedContext: [
@@ -1215,11 +1340,19 @@ describe("WriterAgent", () => {
 
       expect(systemPrompt).not.toContain("Hook-A / Hook-B");
       expect(systemPrompt).toContain("真实 hook_id");
-      expect(creativePrompt).toContain("## Explicit Hook Agenda");
+      // Enum/identifier fields (hookId, movement, chapterType) are NOT sanitized —
+      // the writer needs them to understand which hook to move and what chapter type
+      // to write. Free-text fields (goal, instruction, targetEffect) ARE sanitized.
+      expect(creativePrompt).not.toContain("## Hook Agenda");
+      // hookIds appear verbatim in Hook Plan (identifiers, not free text)
       expect(creativePrompt).toContain("mentor-oath");
       expect(creativePrompt).toContain("ledger-fragment");
-      expect(creativePrompt).toContain("stale-ledger");
-      expect(creativePrompt).toContain("relationship");
+      // But slug references INSIDE free text (targetEffect) are sanitized
+      expect(creativePrompt).not.toContain("stale-ledger");
+      expect(creativePrompt).not.toContain("H001");
+      expect(creativePrompt).not.toContain("本章要做的");
+      // The goal text should survive sanitization
+      expect(creativePrompt).toContain("Push Mara back toward the archive ledger.");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

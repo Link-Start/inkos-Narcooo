@@ -202,6 +202,8 @@ function extractTitleTokens(title: string, language: "zh" | "en"): string[] {
   return [...tokens];
 }
 
+// ── Helpers ────────────────────────────────────────────────────
+
 function isMeaningfulValue(value: string): boolean {
   const normalized = value.trim().toLowerCase();
   if (!normalized) return false;

@@ -9,6 +9,8 @@ const testDir = dirname(fileURLToPath(import.meta.url));
 const cliDir = resolve(testDir, "..", "..");
 const workspaceRoot = resolve(cliDir, "..", "..");
 const studioDir = resolve(workspaceRoot, "packages", "studio");
+const CLI_PACK_TEST_TIMEOUT_MS = 30_000;
+const STUDIO_PACK_TEST_TIMEOUT_MS = 120_000;
 const sourceCliPackageJsonPromise = readFile(resolve(cliDir, "package.json"), "utf-8").then((raw) =>
   JSON.parse(raw),
 );
@@ -16,11 +18,26 @@ const sourceStudioPackageJsonPromise = readFile(resolve(studioDir, "package.json
   JSON.parse(raw),
 );
 
+function tarForceLocalArgs(): string[] {
+  if (process.platform !== "win32") return [];
+  try {
+    const version = execFileSync("tar", ["--version"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return version.includes("GNU tar") ? ["--force-local"] : [];
+  } catch {
+    return [];
+  }
+}
+
 async function packPackage(packageDir: string, packDir: string) {
-  execFileSync("npm", ["pack", "--pack-destination", packDir], {
+  const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
+  execFileSync(npmCmd, ["pack", "--pack-destination", packDir], {
     cwd: packageDir,
     env: process.env,
     encoding: "utf-8",
+    shell: process.platform === "win32",
   });
 
   const tgzFiles = (await readdir(packDir)).filter((name) => name.endsWith(".tgz"));
@@ -33,7 +50,7 @@ async function packPackage(packageDir: string, packDir: string) {
 
 async function extractPackedPackageJson(packageDir: string, packDir: string) {
   const tarballPath = await packPackage(packageDir, packDir);
-  const tarArgs = process.platform === "win32" ? ["--force-local", "-xOf"] : ["-xOf"];
+  const tarArgs = [...tarForceLocalArgs(), "-xOf"];
   return execFileSync("tar", [...tarArgs, tarballPath, "package/package.json"], {
     cwd: workspaceRoot,
     encoding: "utf-8",
@@ -218,7 +235,7 @@ describe.sequential("publish packaging", () => {
     }
   });
 
-  it("replaces workspace dependencies before npm pack", { timeout: 30_000 }, async () => {
+  it("replaces workspace dependencies before npm pack", { timeout: CLI_PACK_TEST_TIMEOUT_MS }, async () => {
     const packDir = await mkdtemp(join(tmpdir(), "inkos-cli-pack-"));
 
     try {
@@ -235,12 +252,12 @@ describe.sequential("publish packaging", () => {
     }
   });
 
-  it("packs the studio runtime entry alongside the built frontend", { timeout: 30_000 }, async () => {
+  it("packs the studio runtime entry alongside the built frontend", { timeout: STUDIO_PACK_TEST_TIMEOUT_MS }, async () => {
     const packDir = await mkdtemp(join(tmpdir(), "inkos-studio-pack-"));
 
     try {
       const tarballPath = await packPackage(studioDir, packDir);
-      const tarArgs = process.platform === "win32" ? ["--force-local", "-tf"] : ["-tf"];
+      const tarArgs = [...tarForceLocalArgs(), "-tf"];
       const archiveListing = execFileSync("tar", [...tarArgs, tarballPath], {
         cwd: workspaceRoot,
         encoding: "utf-8",

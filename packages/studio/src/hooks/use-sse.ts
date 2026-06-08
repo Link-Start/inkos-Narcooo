@@ -24,6 +24,7 @@ export const STUDIO_SSE_EVENTS = [
   "agent:start",
   "agent:complete",
   "agent:error",
+  "session:title",
   "audit:start",
   "audit:complete",
   "audit:error",
@@ -45,6 +46,7 @@ export const STUDIO_SSE_EVENTS = [
   "fanfic:refresh:start",
   "fanfic:refresh:complete",
   "fanfic:refresh:error",
+  "draft:delta",
   "radar:start",
   "radar:complete",
   "radar:error",
@@ -53,7 +55,7 @@ export const STUDIO_SSE_EVENTS = [
   "ping",
 ] as const;
 
-export function useSSE(url = "/api/events") {
+export function useSSE(url = "/api/v1/events") {
   const [messages, setMessages] = useState<ReadonlyArray<SSEMessage>>([]);
   const [connected, setConnected] = useState(false);
   const esRef = useRef<EventSource | null>(null);

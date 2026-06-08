@@ -1,12 +1,9 @@
-import { readFile, readdir, writeFile, mkdir } from "node:fs/promises";
+import { readFile, readdir, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import yaml from "js-yaml";
 import { BaseAgent } from "./base.js";
 import type { BookConfig } from "../models/book.js";
 import {
-  ChapterTraceSchema,
   ContextPackageSchema,
-  RuleStackSchema,
   type ChapterTrace,
   type ContextPackage,
   type RuleStack,
@@ -16,6 +13,11 @@ import {
   parseChapterSummariesMarkdown,
   retrieveMemorySelection,
 } from "../utils/memory-retrieval.js";
+import {
+  buildGovernedRuleStack,
+  buildGovernedTrace,
+} from "../utils/context-assembly.js";
+import { writeGovernedRuntimeArtifacts } from "../utils/runtime-writer.js";
 
 export interface ComposeChapterInput {
   readonly book: BookConfig;
@@ -33,132 +35,129 @@ export interface ComposeChapterOutput {
   readonly tracePath: string;
 }
 
+export async function composeGovernedChapter(input: ComposeChapterInput): Promise<ComposeChapterOutput> {
+  const storyDir = join(input.bookDir, "story");
+  const runtimeDir = join(storyDir, "runtime");
+  await mkdir(runtimeDir, { recursive: true });
+
+  const selectedContext = await collectSelectedContext(
+    storyDir,
+    input.plan,
+    input.book.language ?? "zh",
+  );
+  const contextPackage = ContextPackageSchema.parse({
+    chapter: input.chapterNumber,
+    selectedContext,
+  });
+
+  const ruleStack = buildGovernedRuleStack(input.plan, input.chapterNumber);
+  const trace = buildGovernedTrace({
+    chapterNumber: input.chapterNumber,
+    plan: input.plan,
+    contextPackage,
+    composerInputs: [input.plan.runtimePath],
+  });
+  const {
+    contextPath,
+    ruleStackPath,
+    tracePath,
+  } = await writeGovernedRuntimeArtifacts({
+    runtimeDir,
+    chapterNumber: input.chapterNumber,
+    contextPackage,
+    ruleStack,
+    trace,
+  });
+
+  return {
+    contextPackage,
+    ruleStack,
+    trace,
+    contextPath,
+    ruleStackPath,
+    tracePath,
+  };
+}
+
 export class ComposerAgent extends BaseAgent {
   get name(): string {
     return "composer";
   }
 
   async composeChapter(input: ComposeChapterInput): Promise<ComposeChapterOutput> {
-    const storyDir = join(input.bookDir, "story");
-    const runtimeDir = join(storyDir, "runtime");
-    await mkdir(runtimeDir, { recursive: true });
-
-    const selectedContext = await this.collectSelectedContext(
-      storyDir,
-      input.plan,
-      input.book.language ?? "zh",
-    );
-    const contextPackage = ContextPackageSchema.parse({
-      chapter: input.chapterNumber,
-      selectedContext,
-    });
-
-    const ruleStack = RuleStackSchema.parse({
-      layers: [
-        { id: "L1", name: "hard_facts", precedence: 100, scope: "global" },
-        { id: "L2", name: "author_intent", precedence: 80, scope: "book" },
-        { id: "L3", name: "planning", precedence: 60, scope: "arc" },
-        { id: "L4", name: "current_task", precedence: 70, scope: "local" },
-      ],
-      sections: {
-        hard: ["story_bible", "current_state", "book_rules"],
-        soft: ["author_intent", "current_focus", "volume_outline"],
-        diagnostic: ["anti_ai_checks", "continuity_audit", "style_regression_checks"],
-      },
-      overrideEdges: [
-        { from: "L4", to: "L3", allowed: true, scope: "current_chapter" },
-        { from: "L4", to: "L2", allowed: false, scope: "current_chapter" },
-        { from: "L4", to: "L1", allowed: false, scope: "current_chapter" },
-      ],
-      activeOverrides: input.plan.intent.conflicts.map((conflict) => ({
-        from: "L4",
-        to: "L3",
-        target: input.plan.intent.outlineNode ?? `chapter_${input.chapterNumber}`,
-        reason: conflict.resolution,
-      })),
-    });
-
-    const trace = ChapterTraceSchema.parse({
-      chapter: input.chapterNumber,
-      plannerInputs: input.plan.plannerInputs,
-      composerInputs: [input.plan.runtimePath],
-      selectedSources: contextPackage.selectedContext.map((entry) => entry.source),
-      notes: input.plan.intent.conflicts.map((conflict) => conflict.resolution),
-    });
-
-    const chapterSlug = `chapter-${String(input.chapterNumber).padStart(4, "0")}`;
-    const contextPath = join(runtimeDir, `${chapterSlug}.context.json`);
-    const ruleStackPath = join(runtimeDir, `${chapterSlug}.rule-stack.yaml`);
-    const tracePath = join(runtimeDir, `${chapterSlug}.trace.json`);
-
-    await Promise.all([
-      writeFile(contextPath, JSON.stringify(contextPackage, null, 2), "utf-8"),
-      writeFile(ruleStackPath, yaml.dump(ruleStack, { lineWidth: 120 }), "utf-8"),
-      writeFile(tracePath, JSON.stringify(trace, null, 2), "utf-8"),
-    ]);
-
-    return {
-      contextPackage,
-      ruleStack,
-      trace,
-      contextPath,
-      ruleStackPath,
-      tracePath,
-    };
+    return composeGovernedChapter(input);
   }
+}
 
-  private async collectSelectedContext(
-    storyDir: string,
-    plan: PlanChapterOutput,
-    language: "zh" | "en",
-  ): Promise<ContextPackage["selectedContext"]> {
+async function collectSelectedContext(
+  storyDir: string,
+  plan: PlanChapterOutput,
+  language: "zh" | "en",
+): Promise<ContextPackage["selectedContext"]> {
+    const retrievalHints = deriveRetrievalHints(plan);
+    const memoBodyExcerpt = plan.memo.body.trim();
+    const chapterMemoEntry = memoBodyExcerpt.length > 0
+      ? [{
+          source: "runtime/chapter_memo",
+          reason: "Carry the planner's chapter memo into governed writing.",
+          excerpt: [
+            `goal=${plan.memo.goal}`,
+            plan.memo.isGoldenOpening ? "golden-opening=true" : undefined,
+            memoBodyExcerpt,
+          ].filter(Boolean).join(" | "),
+        }]
+      : [{
+          source: "runtime/chapter_memo",
+          reason: "Carry the planner's chapter memo into governed writing.",
+          excerpt: `goal=${plan.memo.goal}`,
+        }];
+
     const entries = await Promise.all([
-      this.maybeContextSource(storyDir, "current_focus.md", "Current task focus for this chapter."),
-      this.maybeContextSource(
+      maybeContextSource(storyDir, "current_focus.md", "Current task focus for this chapter."),
+      maybeContextSource(
         storyDir,
         "audit_drift.md",
         "Carry forward audit drift guidance from the previous chapter without polluting hard state facts.",
       ),
-      this.maybeContextSource(
+      maybeContextSource(
         storyDir,
         "current_state.md",
-        "Preserve hard state facts referenced by mustKeep.",
-        plan.intent.mustKeep,
+        "Preserve hard state facts referenced by the active chapter brief or hard constraints.",
+        retrievalHints,
       ),
-      this.maybeContextSource(
+      maybeContextSource(
         storyDir,
-        "story_bible.md",
-        "Preserve canon constraints referenced by mustKeep.",
-        plan.intent.mustKeep,
+        "outline/story_frame.md",
+        "Preserve canon constraints referenced by the active chapter brief or hard constraints.",
+        retrievalHints,
       ),
-      this.maybeContextSource(
+      maybeContextSource(
         storyDir,
-        "volume_outline.md",
+        "outline/volume_map.md",
         "Anchor the default planning node for this chapter.",
         plan.intent.outlineNode ? [plan.intent.outlineNode] : [],
       ),
-      this.maybeContextSource(
+      maybeContextSource(
         storyDir,
         "parent_canon.md",
         "Preserve parent canon constraints for governed continuation or fanfic writing.",
       ),
-      this.maybeContextSource(
+      maybeContextSource(
         storyDir,
         "fanfic_canon.md",
         "Preserve extracted fanfic canon constraints for governed writing.",
       ),
     ]);
-    const trailEntries = await this.buildRecentChapterTrailEntries(storyDir, plan.intent.chapter);
+    const trailEntries = await buildRecentChapterTrailEntries(storyDir, plan.intent.chapter);
 
-    const planningAnchor = plan.intent.conflicts.length > 0 ? undefined : plan.intent.outlineNode;
     const memorySelection = await retrieveMemorySelection({
       bookDir: dirname(storyDir),
       chapterNumber: plan.intent.chapter,
       goal: plan.intent.goal,
-      outlineNode: planningAnchor,
-      mustKeep: plan.intent.mustKeep,
+      outlineNode: plan.intent.outlineNode,
+      mustKeep: retrievalHints,
     });
-    const hookDebtEntries = await this.buildHookDebtEntries(
+    const hookDebtEntries = await buildHookDebtEntries(
       storyDir,
       plan,
       memorySelection.activeHooks,
@@ -173,7 +172,7 @@ export class ComposerAgent extends BaseAgent {
         .join(" | "),
     }));
     const factEntries = memorySelection.facts.map((fact) => ({
-      source: `story/current_state.md#${this.toFactAnchor(fact.predicate)}`,
+      source: `story/current_state.md#${toFactAnchor(fact.predicate)}`,
       reason: "Relevant current-state fact retrieved for the current chapter goal.",
       excerpt: `${fact.predicate} | ${fact.object}`,
     }));
@@ -191,6 +190,7 @@ export class ComposerAgent extends BaseAgent {
     }));
 
     return [
+      ...chapterMemoEntry,
       ...entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null),
       ...trailEntries,
       ...hookDebtEntries,
@@ -199,13 +199,21 @@ export class ComposerAgent extends BaseAgent {
       ...volumeSummaryEntries,
       ...hookEntries,
     ];
-  }
+}
 
-  private async buildRecentChapterTrailEntries(
-    storyDir: string,
-    chapterNumber: number,
-  ): Promise<ContextPackage["selectedContext"]> {
-    const content = await this.readFileOrDefault(join(storyDir, "chapter_summaries.md"));
+function deriveRetrievalHints(plan: PlanChapterOutput): string[] {
+  return [
+    plan.intent.goal,
+    plan.intent.outlineNode,
+    ...plan.memo.threadRefs,
+  ].filter((value): value is string => Boolean(value));
+}
+
+async function buildRecentChapterTrailEntries(
+  storyDir: string,
+  chapterNumber: number,
+): Promise<ContextPackage["selectedContext"]> {
+    const content = await readFileOrDefault(join(storyDir, "chapter_summaries.md"));
     if (!content || content === "(文件尚未创建)") {
       return [];
     }
@@ -243,7 +251,7 @@ export class ComposerAgent extends BaseAgent {
       });
     }
 
-    const endingTrail = await this.buildRecentEndingTrail(storyDir, chapterNumber);
+    const endingTrail = await buildRecentEndingTrail(storyDir, chapterNumber);
     if (endingTrail) {
       entries.push({
         source: "story/chapters#recent_endings",
@@ -253,12 +261,12 @@ export class ComposerAgent extends BaseAgent {
     }
 
     return entries;
-  }
+}
 
-  private async buildRecentEndingTrail(
-    storyDir: string,
-    chapterNumber: number,
-  ): Promise<string | undefined> {
+async function buildRecentEndingTrail(
+  storyDir: string,
+  chapterNumber: number,
+): Promise<string | undefined> {
     const chaptersDir = join(dirname(storyDir), "chapters");
     try {
       const files = await readdir(chaptersDir);
@@ -272,7 +280,7 @@ export class ComposerAgent extends BaseAgent {
       const endings: string[] = [];
       for (const entry of chapterFiles.reverse()) {
         const content = await readFile(join(chaptersDir, entry.file), "utf-8");
-        const lastLine = this.extractLastMeaningfulSentence(content);
+        const lastLine = extractLastMeaningfulSentence(content);
         if (lastLine) {
           endings.push(`ch${entry.num}: ${lastLine}`);
         }
@@ -281,21 +289,21 @@ export class ComposerAgent extends BaseAgent {
     } catch {
       return undefined;
     }
-  }
+}
 
-  private extractLastMeaningfulSentence(content: string): string | undefined {
+function extractLastMeaningfulSentence(content: string): string | undefined {
     const lines = content.split("\n").map((line) => line.trim()).filter((line) =>
       line.length > 5 && !line.startsWith("#") && !line.startsWith("|") && !line.startsWith("==="),
     );
     const last = lines.at(-1);
     if (!last) return undefined;
     return last.length > 60 ? last.slice(0, 57) + "..." : last;
-  }
+}
 
-  private async buildHookDebtEntries(
-    storyDir: string,
-    plan: PlanChapterOutput,
-    activeHooks: ReadonlyArray<{
+async function buildHookDebtEntries(
+  storyDir: string,
+  plan: PlanChapterOutput,
+  activeHooks: ReadonlyArray<{
       readonly hookId: string;
       readonly startChapter: number;
       readonly type: string;
@@ -305,22 +313,15 @@ export class ComposerAgent extends BaseAgent {
       readonly payoffTiming?: string;
       readonly notes: string;
     }>,
-    language: "zh" | "en",
-  ): Promise<ContextPackage["selectedContext"]> {
-    const targetHookIds = [
-      ...new Set([
-        ...plan.intent.hookAgenda.pressureMap.map((entry) => entry.hookId),
-        ...plan.intent.hookAgenda.eligibleResolve,
-        ...plan.intent.hookAgenda.mustAdvance,
-        ...plan.intent.hookAgenda.staleDebt,
-      ]),
-    ];
+  language: "zh" | "en",
+): Promise<ContextPackage["selectedContext"]> {
+    const targetHookIds = [...new Set(plan.memo.threadRefs)];
     if (targetHookIds.length === 0) {
       return [];
     }
 
     const summaries = parseChapterSummariesMarkdown(
-      await this.readFileOrDefault(join(storyDir, "chapter_summaries.md")),
+      await readFileOrDefault(join(storyDir, "chapter_summaries.md")),
     );
 
     return targetHookIds.flatMap((hookId) => {
@@ -329,15 +330,15 @@ export class ComposerAgent extends BaseAgent {
         return [];
       }
 
-      const seedSummary = this.findHookSummary(summaries, hook.hookId, hook.startChapter, "seed");
-      const latestSummary = this.findHookSummary(summaries, hook.hookId, hook.lastAdvancedChapter, "latest");
-      const role = this.describeHookAgendaRole(plan, hook.hookId, language);
+      const seedSummary = findHookSummary(summaries, hook.hookId, hook.startChapter, "seed");
+      const latestSummary = findHookSummary(summaries, hook.hookId, hook.lastAdvancedChapter, "latest");
+      const role = language === "en" ? "memo-referenced debt" : "备忘引用旧债";
       const promise = hook.expectedPayoff || (language === "en" ? "(unspecified)" : "（未写明）");
       const seedBeat = seedSummary
-        ? this.renderHookDebtBeat(seedSummary)
+        ? renderHookDebtBeat(seedSummary)
         : (hook.notes || promise);
       const latestBeat = latestSummary && latestSummary !== seedSummary
-        ? this.renderHookDebtBeat(latestSummary)
+        ? renderHookDebtBeat(latestSummary)
         : undefined;
       const age = Math.max(0, plan.intent.chapter - Math.max(1, hook.startChapter));
 
@@ -361,26 +362,48 @@ export class ComposerAgent extends BaseAgent {
             ].filter(Boolean).join(" | "),
       }];
     });
-  }
+}
 
-  private async maybeContextSource(
-    storyDir: string,
-    fileName: string,
-    reason: string,
-    preferredExcerpts: ReadonlyArray<string> = [],
-  ): Promise<ContextPackage["selectedContext"][number] | null> {
+async function maybeContextSource(
+  storyDir: string,
+  fileName: string,
+  reason: string,
+  preferredExcerpts: ReadonlyArray<string> = [],
+): Promise<ContextPackage["selectedContext"][number] | null> {
     const path = join(storyDir, fileName);
-    const content = await this.readFileOrDefault(path);
+    let content = await readFileOrDefault(path);
+    let resolvedFileName = fileName;
+
+    if ((!content || content === "(文件尚未创建)")) {
+      // Phase 5 back-compat: the new outline/ files may be absent on legacy
+      // books. Fall back to the deprecated paths transparently.
+      const legacyFallback = outlineFallback(fileName);
+      if (legacyFallback) {
+        const legacyPath = join(storyDir, legacyFallback);
+        const legacyContent = await readFileOrDefault(legacyPath);
+        if (legacyContent && legacyContent !== "(文件尚未创建)") {
+          content = legacyContent;
+          resolvedFileName = legacyFallback;
+        }
+      }
+    }
+
     if (!content || content === "(文件尚未创建)") return null;
 
     return {
-      source: `story/${fileName}`,
+      source: `story/${resolvedFileName}`,
       reason,
-      excerpt: this.pickExcerpt(content, preferredExcerpts),
+      excerpt: pickExcerpt(content, preferredExcerpts),
     };
-  }
+}
 
-  private pickExcerpt(content: string, preferredExcerpts: ReadonlyArray<string>): string | undefined {
+function outlineFallback(fileName: string): string | null {
+    if (fileName === "outline/story_frame.md") return "story_bible.md";
+    if (fileName === "outline/volume_map.md") return "volume_outline.md";
+    return null;
+}
+
+function pickExcerpt(content: string, preferredExcerpts: ReadonlyArray<string>): string | undefined {
     for (const preferred of preferredExcerpts) {
       if (preferred && content.includes(preferred)) return preferred;
     }
@@ -389,73 +412,58 @@ export class ComposerAgent extends BaseAgent {
       .split("\n")
       .map((line) => line.trim())
       .find((line) => line.length > 0 && !line.startsWith("#"));
-  }
+}
 
-  private toFactAnchor(predicate: string): string {
+function toFactAnchor(predicate: string): string {
     return predicate
       .trim()
       .toLowerCase()
       .replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-")
       .replace(/^-+|-+$/g, "")
       || "fact";
+}
+
+async function readFileOrDefault(path: string): Promise<string> {
+  try {
+    return await readFile(path, "utf-8");
+  } catch {
+    return "(文件尚未创建)";
   }
+}
 
-  private async readFileOrDefault(path: string): Promise<string> {
-    try {
-      return await readFile(path, "utf-8");
-    } catch {
-      return "(文件尚未创建)";
-    }
-  }
-
-  private describeHookAgendaRole(
-    plan: PlanChapterOutput,
-    hookId: string,
-    language: "zh" | "en",
-  ): string {
-    if (plan.intent.hookAgenda.eligibleResolve.includes(hookId)) {
-      return language === "en" ? "payoff-ready debt" : "可兑现旧债";
-    }
-    if (plan.intent.hookAgenda.staleDebt.includes(hookId)) {
-      return language === "en" ? "high-pressure debt" : "高压旧债";
-    }
-    return language === "en" ? "mainline debt" : "主要旧债";
-  }
-
-  private findHookSummary(
-    summaries: ReadonlyArray<ReturnType<typeof parseChapterSummariesMarkdown>[number]>,
-    hookId: string,
-    chapter: number,
-    mode: "seed" | "latest",
-  ) {
-    const directChapterHit = summaries.find((summary) => summary.chapter === chapter);
-    const hookMentions = summaries.filter((summary) => this.summaryMentionsHook(summary, hookId));
-    if (mode === "seed") {
-      return hookMentions.find((summary) => summary.chapter === chapter)
-        ?? hookMentions.at(0)
-        ?? directChapterHit;
-    }
-
-    return [...hookMentions].reverse().find((summary) => summary.chapter === chapter)
-      ?? hookMentions.at(-1)
+function findHookSummary(
+  summaries: ReadonlyArray<ReturnType<typeof parseChapterSummariesMarkdown>[number]>,
+  hookId: string,
+  chapter: number,
+  mode: "seed" | "latest",
+) {
+  const directChapterHit = summaries.find((summary) => summary.chapter === chapter);
+  const hookMentions = summaries.filter((summary) => summaryMentionsHook(summary, hookId));
+  if (mode === "seed") {
+    return hookMentions.find((summary) => summary.chapter === chapter)
+      ?? hookMentions.at(0)
       ?? directChapterHit;
   }
 
-  private summaryMentionsHook(
-    summary: ReturnType<typeof parseChapterSummariesMarkdown>[number],
-    hookId: string,
-  ): boolean {
-    return [
-      summary.title,
-      summary.events,
-      summary.stateChanges,
-      summary.hookActivity,
-    ].some((text) => text.includes(hookId));
-  }
+  return [...hookMentions].reverse().find((summary) => summary.chapter === chapter)
+    ?? hookMentions.at(-1)
+    ?? directChapterHit;
+}
 
-  private renderHookDebtBeat(
-    summary: ReturnType<typeof parseChapterSummariesMarkdown>[number],
-  ): string {
-    return `ch${summary.chapter} ${summary.title} - ${summary.events || summary.hookActivity || summary.stateChanges || "(none)"}`;
-  }
+function summaryMentionsHook(
+  summary: ReturnType<typeof parseChapterSummariesMarkdown>[number],
+  hookId: string,
+): boolean {
+  return [
+    summary.title,
+    summary.events,
+    summary.stateChanges,
+    summary.hookActivity,
+  ].some((text) => text.includes(hookId));
+}
+
+function renderHookDebtBeat(
+  summary: ReturnType<typeof parseChapterSummariesMarkdown>[number],
+): string {
+  return `ch${summary.chapter} ${summary.title} - ${summary.events || summary.hookActivity || summary.stateChanges || "(none)"}`;
 }

@@ -1,101 +1,216 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
+import YAML from "js-yaml";
 import type { PlanChapterOutput } from "../agents/planner.js";
-import { ChapterIntentSchema } from "../models/input-governance.js";
+import {
+  ChapterIntentSchema,
+  type ChapterIntent,
+} from "../models/input-governance.js";
+import { parseMemo, PlannerParseError } from "../utils/chapter-memo-parser.js";
+
+/**
+ * Phase 4: persisted governed plans are stored as a single markdown file
+ * containing YAML frontmatter (memo + intent extensions + plannerInputs)
+ * followed by the memo body (7 required sections).
+ *
+ * File path: `story/runtime/chapter-NNNN.plan.md`
+ *
+ * The sibling `chapter-NNNN.intent.md` file stays as a human-readable
+ * render — it is not parsed back. We keep it in sync by regenerating
+ * downstream, but only this `.plan.md` is authoritative for restore.
+ *
+ * If parse fails for any reason we return null and let the runner re-invoke
+ * the planner. We never try to partially reconstruct — silent degradation
+ * is worse than re-planning.
+ */
+
+function planPath(bookDir: string, chapterNumber: number): string {
+  const runtimeDir = join(bookDir, "story", "runtime");
+  const padded = String(chapterNumber).padStart(4, "0");
+  return join(runtimeDir, `chapter-${padded}.plan.md`);
+}
+
+function intentPath(bookDir: string, chapterNumber: number): string {
+  const runtimeDir = join(bookDir, "story", "runtime");
+  const padded = String(chapterNumber).padStart(4, "0");
+  return join(runtimeDir, `chapter-${padded}.intent.md`);
+}
+
+export async function savePersistedPlan(
+  bookDir: string,
+  plan: PlanChapterOutput,
+): Promise<void> {
+  const { intent, memo, plannerInputs } = plan;
+  const frontmatter = {
+    chapter: memo.chapter,
+    goal: memo.goal,
+    isGoldenOpening: memo.isGoldenOpening,
+    threadRefs: memo.threadRefs,
+    intent: {
+      goal: intent.goal,
+      outlineNode: intent.outlineNode,
+      arcContext: intent.arcContext,
+      mustKeep: intent.mustKeep,
+      mustAvoid: intent.mustAvoid,
+      styleEmphasis: intent.styleEmphasis,
+    },
+    plannerInputs: [...plannerInputs],
+  };
+  const yaml = YAML.dump(frontmatter, { lineWidth: -1 });
+  const content = `---\n${yaml}---\n${memo.body}\n`;
+  await writeFile(planPath(bookDir, memo.chapter), content, "utf-8");
+}
 
 export async function loadPersistedPlan(
   bookDir: string,
   chapterNumber: number,
 ): Promise<PlanChapterOutput | null> {
-  const runtimePath = join(
-    bookDir,
-    "story",
-    "runtime",
-    `chapter-${String(chapterNumber).padStart(4, "0")}.intent.md`,
-  );
-
+  let raw: string;
   try {
-    const intentMarkdown = await readFile(runtimePath, "utf-8");
-    const sections = parseIntentSections(intentMarkdown);
-    const goal = readIntentScalar(sections, "Goal");
-    if (!goal || isInvalidPersistedIntentScalar(goal)) return null;
+    raw = await readFile(planPath(bookDir, chapterNumber), "utf-8");
+  } catch {
+    return loadLegacyIntentPlan(bookDir, chapterNumber);
+  }
 
-    const outlineNode = readIntentScalar(sections, "Outline Node");
-    if (outlineNode && outlineNode !== "(not found)" && isInvalidPersistedIntentScalar(outlineNode)) {
-      return null;
-    }
-    const conflicts = readIntentList(sections, "Conflicts")
-      .map((line) => {
-        const separator = line.indexOf(":");
-        if (separator < 0) return null;
+  const match = raw.trim().match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
+  if (!match) return null;
 
-        const type = line.slice(0, separator).trim();
-        const resolution = line.slice(separator + 1).trim();
-        if (!type || !resolution) return null;
-        return { type, resolution };
-      })
-      .filter((conflict): conflict is { type: string; resolution: string } => conflict !== null);
-
-    return {
-      intent: ChapterIntentSchema.parse({
-        chapter: chapterNumber,
-        goal,
-        outlineNode: outlineNode && outlineNode !== "(not found)" ? outlineNode : undefined,
-        mustKeep: readIntentList(sections, "Must Keep"),
-        mustAvoid: readIntentList(sections, "Must Avoid"),
-        styleEmphasis: readIntentList(sections, "Style Emphasis"),
-        conflicts,
-      }),
-      intentMarkdown,
-      plannerInputs: [runtimePath],
-      runtimePath,
-    };
+  let fm: unknown;
+  try {
+    fm = YAML.load(match[1]!);
   } catch {
     return null;
   }
+  if (!fm || typeof fm !== "object" || Array.isArray(fm)) return null;
+  const f = fm as Record<string, unknown>;
+
+  if (typeof f.chapter !== "number" || f.chapter !== chapterNumber) return null;
+  if (typeof f.isGoldenOpening !== "boolean") return null;
+  if (!f.intent || typeof f.intent !== "object") return null;
+
+  // Reconstruct memo via the same strict parser planner uses. This guarantees
+  // the 7 required section headings are still present — any drift triggers
+  // re-planning (null return).
+  let memo;
+  try {
+    const reconstructed = `---\n${YAML.dump({
+      chapter: f.chapter,
+      goal: f.goal,
+      threadRefs: f.threadRefs,
+    })}---\n${match[2]!}`;
+    memo = parseMemo(reconstructed, chapterNumber, f.isGoldenOpening);
+  } catch (error) {
+    if (error instanceof PlannerParseError) return null;
+    throw error;
+  }
+
+  let intent: ChapterIntent;
+  try {
+    intent = ChapterIntentSchema.parse({
+      chapter: chapterNumber,
+      ...(f.intent as Record<string, unknown>),
+    });
+  } catch {
+    return null;
+  }
+
+  const plannerInputs = Array.isArray(f.plannerInputs)
+    ? f.plannerInputs.filter((value): value is string => typeof value === "string")
+    : [];
+
+  // intentMarkdown is a display artifact — read the sibling .intent.md so we
+  // surface the same content downstream consumers expect. If it's missing we
+  // fall back to the memo body, which is usable but less rich.
+  let intentMarkdown = memo.body;
+  try {
+    intentMarkdown = await readFile(intentPath(bookDir, chapterNumber), "utf-8");
+  } catch {
+    // fall through — memo body is a safe default.
+  }
+
+  return {
+    intent,
+    memo,
+    intentMarkdown,
+    plannerInputs,
+    runtimePath: intentPath(bookDir, chapterNumber),
+  };
+}
+
+async function loadLegacyIntentPlan(
+  bookDir: string,
+  chapterNumber: number,
+): Promise<PlanChapterOutput | null> {
+  let intentMarkdown: string;
+  const runtimePath = intentPath(bookDir, chapterNumber);
+  try {
+    intentMarkdown = await readFile(runtimePath, "utf-8");
+  } catch {
+    return null;
+  }
+
+  const rawGoal = extractSection(intentMarkdown, "Goal");
+  if (!rawGoal || !isMeaningfulLegacyValue(rawGoal)) return null;
+  const goal = rawGoal;
+  const outlineNodeRaw = extractSection(intentMarkdown, "Outline Node");
+  const outlineNode = outlineNodeRaw && isMeaningfulLegacyValue(outlineNodeRaw)
+    ? outlineNodeRaw
+    : undefined;
+
+  const intent: ChapterIntent = ChapterIntentSchema.parse({
+    chapter: chapterNumber,
+    goal,
+    outlineNode,
+    mustKeep: extractListSection(intentMarkdown, "Must Keep"),
+    mustAvoid: extractListSection(intentMarkdown, "Must Avoid"),
+    styleEmphasis: extractListSection(intentMarkdown, "Style Emphasis"),
+  });
+
+  return {
+    intent,
+    memo: {
+      chapter: chapterNumber,
+      goal: goal.slice(0, 50),
+      isGoldenOpening: false,
+      body: intentMarkdown,
+      threadRefs: [],
+    },
+    intentMarkdown,
+    plannerInputs: [relativeToBookDir(bookDir, runtimePath)],
+    runtimePath,
+  };
+}
+
+function extractSection(markdown: string, heading: string): string | undefined {
+  const match = markdown.match(new RegExp(`^## ${escapeRegExp(heading)}\\s*\\n([\\s\\S]*?)(?=\\n## |\\n### |$)`, "m"));
+  const value = match?.[1]?.trim();
+  return value && value !== "- none" ? value : undefined;
+}
+
+function extractListSection(markdown: string, heading: string): string[] {
+  const section = extractSection(markdown, heading);
+  if (!section) return [];
+  return section
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("-"))
+    .map((line) => line.replace(/^-\s*/, "").trim())
+    .filter((line) => line.length > 0 && line.toLowerCase() !== "none");
+}
+
+function isMeaningfulLegacyValue(value: string): boolean {
+  const normalized = value.trim();
+  if (!normalized) return false;
+  if (/^\(?not found\)?$/i.test(normalized)) return false;
+  if (/^(?:none|null|undefined|n\/a)$/i.test(normalized)) return false;
+  if (/^[*_`\-\s]+$/.test(normalized)) return false;
+  return true;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export function relativeToBookDir(bookDir: string, absolutePath: string): string {
   return relative(bookDir, absolutePath).replaceAll("\\", "/");
-}
-
-function parseIntentSections(markdown: string): Map<string, string[]> {
-  const sections = new Map<string, string[]>();
-  let current: string | null = null;
-
-  for (const line of markdown.split("\n")) {
-    if (line.startsWith("## ")) {
-      current = line.slice(3).trim();
-      sections.set(current, []);
-      continue;
-    }
-
-    if (!current) continue;
-    sections.get(current)?.push(line);
-  }
-
-  return sections;
-}
-
-function readIntentScalar(sections: Map<string, string[]>, name: string): string | undefined {
-  const lines = sections.get(name) ?? [];
-  const value = lines.map((line) => line.trim()).find((line) => line.length > 0);
-  return value && value !== "- none" ? value : undefined;
-}
-
-function readIntentList(sections: Map<string, string[]>, name: string): string[] {
-  return (sections.get(name) ?? [])
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith("-") && line !== "- none")
-    .map((line) => line.replace(/^-\s*/, ""));
-}
-
-function isInvalidPersistedIntentScalar(value: string): boolean {
-  const normalized = value.trim();
-  if (!normalized) return true;
-  if (/^[*_`~:：|.-]+$/.test(normalized)) return true;
-  return (
-    /^\((describe|briefly describe|write)\b[\s\S]*\)$/i.test(normalized)
-    || /^（(?:在这里描述|描述|填写|写下)[\s\S]*）$/u.test(normalized)
-  );
 }

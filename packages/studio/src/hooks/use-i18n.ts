@@ -6,7 +6,7 @@ const strings = {
   // Header
   "nav.books": { zh: "书籍", en: "Books" },
   "nav.newBook": { zh: "新建书籍", en: "New Book" },
-  "nav.config": { zh: "配置", en: "Config" },
+  "nav.config": { zh: "模型配置", en: "Model Config" },
   "nav.connected": { zh: "已连接", en: "Connected" },
   "nav.disconnected": { zh: "未连接", en: "Disconnected" },
 
@@ -83,6 +83,7 @@ const strings = {
   "nav.agentOnline": { zh: "代理在线", en: "Agent Online" },
   "nav.agentOffline": { zh: "代理离线", en: "Agent Offline" },
   "nav.tools": { zh: "工具", en: "Tools" },
+  "nav.chat": { zh: "普通聊天", en: "Chat" },
   "nav.style": { zh: "文风", en: "Style" },
   "nav.import": { zh: "导入", en: "Import" },
   "nav.radar": { zh: "市场雷达", en: "Radar" },
@@ -157,6 +158,7 @@ const strings = {
   "radar.scanning": { zh: "扫描中...", en: "Scanning..." },
   "radar.summary": { zh: "市场概要", en: "Market Summary" },
   "radar.emptyHint": { zh: "点击「扫描市场」分析当前趋势和机会", en: "Click \"Scan Market\" to analyze trends and opportunities" },
+  "radar.history": { zh: "扫描历史", en: "Scan History" },
 
   // Doctor
   "doctor.title": { zh: "环境诊断", en: "Environment Check" },
@@ -173,6 +175,7 @@ const strings = {
 
   // Genre extras
   "genre.createNew": { zh: "创建新题材", en: "Create New Genre" },
+  "genre.name": { zh: "名称", en: "Name" },
   "genre.editGenre": { zh: "编辑", en: "Edit" },
   "genre.deleteGenre": { zh: "删除", en: "Delete" },
   "genre.confirmDelete": { zh: "确认删除此题材？", en: "Delete this genre?" },

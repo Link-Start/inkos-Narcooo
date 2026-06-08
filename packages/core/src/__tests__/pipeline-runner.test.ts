@@ -3,12 +3,12 @@ import { createRequire } from "node:module";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PipelineRunner } from "../pipeline/runner.js";
+import { buildImportFoundationSource, PipelineRunner } from "../pipeline/runner.js";
 import * as llmProvider from "../llm/provider.js";
 import { StateManager } from "../state/manager.js";
 import { ArchitectAgent } from "../agents/architect.js";
 import { PlannerAgent } from "../agents/planner.js";
-import { ComposerAgent } from "../agents/composer.js";
+import * as ComposerModule from "../agents/composer.js";
 import { WriterAgent, type WriteChapterOutput } from "../agents/writer.js";
 import { LengthNormalizerAgent } from "../agents/length-normalizer.js";
 import { ContinuityAuditor, type AuditIssue, type AuditResult } from "../agents/continuity.js";
@@ -16,6 +16,7 @@ import { ReviserAgent, type ReviseOutput } from "../agents/reviser.js";
 import { ChapterAnalyzerAgent } from "../agents/chapter-analyzer.js";
 import { StateValidatorAgent } from "../agents/state-validator.js";
 import { FoundationReviewerAgent } from "../agents/foundation-reviewer.js";
+import { PolisherAgent } from "../agents/polisher.js";
 import type { BookConfig } from "../models/book.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import { MemoryDB } from "../state/memory-db.js";
@@ -33,12 +34,41 @@ const hasNodeSqlite = (() => {
 })();
 
 const sqliteIt = hasNodeSqlite ? it : it.skip;
+const SLOW_PIPELINE_TEST_TIMEOUT_MS = 15_000;
 
 const ZERO_USAGE = {
   promptTokens: 0,
   completionTokens: 0,
   totalTokens: 0,
 } as const;
+
+describe("buildImportFoundationSource", () => {
+  it("compacts large imported books into opening, middle anchors, ending, and title catalog", () => {
+    const chapters = Array.from({ length: 36 }, (_, index) => {
+      const n = index + 1;
+      return {
+        title: `第${n}章 标题${n}`,
+        content: `OPEN-${n}\n${"正文".repeat(3000)}\nTAIL-${n}`,
+      };
+    });
+    const fullText = chapters.map((chapter, index) => `第${index + 1}章 ${chapter.title}\n\n${chapter.content}`).join("\n\n---\n\n");
+
+    const source = buildImportFoundationSource(chapters, "zh", {
+      maxFullTextChars: 20_000,
+      chapterExcerptChars: 1_200,
+      titleCatalogChars: 2_000,
+    });
+
+    expect(source.length).toBeLessThan(fullText.length / 2);
+    expect(source).toContain("压缩资料包");
+    expect(source).toContain("完整章节将在后续顺序回放");
+    expect(source).toContain("第1章 第1章 标题1");
+    expect(source).toContain("第36章 第36章 标题36");
+    expect(source).toContain("OPEN-1");
+    expect(source).toContain("TAIL-36");
+    expect(source).not.toContain("正文".repeat(2500));
+  });
+});
 
 const CRITICAL_ISSUE: AuditIssue = {
   severity: "critical",
@@ -52,6 +82,7 @@ function createAuditResult(overrides: Partial<AuditResult>): AuditResult {
     passed: true,
     issues: [],
     summary: "ok",
+    overallScore: 90,
     tokenUsage: ZERO_USAGE,
     ...overrides,
   };
@@ -187,7 +218,7 @@ async function createRunnerFixture(
       defaults: {
         temperature: 0.7,
         maxTokens: 4096,
-        thinkingBudget: 0, maxTokensCap: null,
+        thinkingBudget: 0,
       },
     } as ConstructorParameters<typeof PipelineRunner>[0]["client"],
     model: "test-model",
@@ -200,6 +231,54 @@ async function createRunnerFixture(
 
 describe("PipelineRunner", () => {
   beforeEach(() => {
+    vi.spyOn(PlannerAgent.prototype, "planChapter").mockImplementation(async (input) => {
+      const chapterNumber = input.chapterNumber;
+      const goal = input.externalContext ?? "test goal";
+      const memo = {
+        chapter: chapterNumber,
+        goal,
+        isGoldenOpening: false,
+        body: "",
+        threadRefs: [] as string[],
+      };
+      const intentMarkdown = [
+        "# Chapter Intent",
+        "",
+        "## Goal",
+        goal,
+        "",
+        "## Outline Node",
+        "(not found)",
+        "",
+        "## Must Keep",
+        "- none",
+        "",
+        "## Must Avoid",
+        "- none",
+        "",
+        "## Style Emphasis",
+        "- none",
+        "",
+      ].join("\n");
+      const runtimeDir = join(input.bookDir, "story", "runtime");
+      const { mkdir: mkdirFs, writeFile: writeFileFs } = await import("node:fs/promises");
+      await mkdirFs(runtimeDir, { recursive: true });
+      const runtimePath = join(runtimeDir, `chapter-${String(chapterNumber).padStart(4, "0")}.intent.md`);
+      await writeFileFs(runtimePath, intentMarkdown, "utf-8");
+      return {
+        intent: {
+          chapter: chapterNumber,
+          goal,
+          mustKeep: [],
+          mustAvoid: [],
+          styleEmphasis: [],
+        },
+        memo,
+        intentMarkdown,
+        plannerInputs: [runtimePath],
+        runtimePath,
+      };
+    });
     vi.spyOn(FoundationReviewerAgent.prototype, "review").mockResolvedValue({
       passed: true,
       totalScore: 85,
@@ -219,6 +298,16 @@ describe("PipelineRunner", () => {
       warnings: [],
       passed: true,
     });
+    // Default reviser mock: return input content unchanged so the review cycle's
+    // repair loop exits immediately when triggered by length-out-of-range content.
+    // Tests that need specific revision behavior override this mock explicitly.
+    vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockImplementation(
+      async (_bookDir, chapterContent, _chapterNumber, _issues, _mode, _genre, _options) =>
+        createReviseOutput({
+          revisedContent: chapterContent,
+          wordCount: chapterContent.length,
+        }),
+    );
   });
 
   afterEach(() => {
@@ -240,18 +329,19 @@ describe("PipelineRunner", () => {
           defaults: {
             temperature: 0.7,
             maxTokens: 4096,
-            thinkingBudget: 0, maxTokensCap: null,
+            thinkingBudget: 0,
           },
         } as ConstructorParameters<typeof PipelineRunner>[0]["client"],
         model: "base-model",
         projectRoot: process.cwd(),
         defaultLLMConfig: {
           provider: "custom",
+          service: "custom",
+          configSource: "env",
           baseUrl: "https://base.example/v1",
           apiKey: "base-key",
           model: "base-model",
           temperature: 0.7,
-          maxTokens: 4096,
           thinkingBudget: 0,
           apiFormat: "chat",
           stream: false,
@@ -315,8 +405,7 @@ describe("PipelineRunner", () => {
         stream: false,
         defaults: {
           temperature: 0.7,
-          maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
         },
       } as ConstructorParameters<typeof PipelineRunner>[0]["client"],
       model: "test-model",
@@ -348,6 +437,68 @@ describe("PipelineRunner", () => {
     }
   });
 
+  it("applies creation-draft overrides while initializing a book", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-init-book-overrides-"));
+    const bookId = "override-book";
+    const book: BookConfig = {
+      id: bookId,
+      title: "Override Book",
+      platform: "tomato",
+      genre: "xuanhuan",
+      status: "outlining",
+      targetChapters: 20,
+      chapterWordCount: 2800,
+      createdAt: "2026-04-13T00:00:00.000Z",
+      updatedAt: "2026-04-13T00:00:00.000Z",
+    };
+
+    const runner = new PipelineRunner({
+      client: {
+        provider: "openai",
+        apiFormat: "chat",
+        stream: false,
+        defaults: {
+          temperature: 0.7,
+          thinkingBudget: 0,
+        },
+      } as ConstructorParameters<typeof PipelineRunner>[0]["client"],
+      model: "test-model",
+      projectRoot: root,
+    });
+
+    const generateFoundationSpy = vi.spyOn(ArchitectAgent.prototype, "generateFoundation").mockResolvedValue({
+      storyBible: "# Story Bible\n",
+      volumeOutline: "# Volume Outline\n",
+      bookRules: "---\nversion: \"1.0\"\n---\n\n# Book Rules\n",
+      currentState: "# Current State\n",
+      pendingHooks: "# Pending Hooks\n",
+    });
+
+    try {
+      await runner.initBook(book, {
+        externalContext: "世界观重点：近未来港口城，账本与旧案牵出多方势力。",
+        authorIntent: "# 作者意图\n\n写成冷硬、克制、利益驱动的商战悬疑。\n",
+        currentFocus: "# 当前聚焦\n\n先把旧账线和港口势力网立住。\n",
+      });
+
+      expect(generateFoundationSpy).toHaveBeenCalledWith(
+        book,
+        expect.stringContaining("近未来港口城"),
+        undefined,
+      );
+
+      const storyDir = join(root, "books", bookId, "story");
+      await expect(readFile(join(storyDir, "author_intent.md"), "utf-8"))
+        .resolves.toContain("冷硬、克制、利益驱动");
+      await expect(readFile(join(storyDir, "current_focus.md"), "utf-8"))
+        .resolves.toContain("旧账线和港口势力网");
+      await expect(readFile(join(storyDir, "brief.md"), "utf-8"))
+        .resolves.toContain("近未来港口城");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("feeds foundation review feedback into the regeneration call after a rejection", async () => {
     const { root, runner, bookId } = await createRunnerFixture();
     const reviewer = new FoundationReviewerAgent({
@@ -357,8 +508,7 @@ describe("PipelineRunner", () => {
         stream: false,
         defaults: {
           temperature: 0.7,
-          maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
         },
       } as ConstructorParameters<typeof PipelineRunner>[0]["client"],
       model: "test-model",
@@ -432,6 +582,68 @@ describe("PipelineRunner", () => {
     }
   });
 
+  it("honors configured foundation review retry count before accepting a rejected foundation", async () => {
+    const { root, runner, bookId } = await createRunnerFixture({
+      foundationReviewRetries: 4,
+    } as Partial<ConstructorParameters<typeof PipelineRunner>[0]>);
+    const reviewer = new FoundationReviewerAgent({
+      client: {
+        provider: "openai",
+        apiFormat: "chat",
+        stream: false,
+        defaults: {
+          temperature: 0.7,
+          thinkingBudget: 0,
+        },
+      } as ConstructorParameters<typeof PipelineRunner>[0]["client"],
+      model: "test-model",
+      projectRoot: root,
+      bookId,
+    });
+    const foundation = {
+      storyBible: "# Story Bible",
+      volumeOutline: "# Volume Outline",
+      bookRules: "---\nversion: \"1.0\"\n---\n\n# Book Rules",
+      currentState: "# Current State",
+      pendingHooks: "# Pending Hooks",
+    };
+    const generate = vi.fn(async (_reviewFeedback?: string) => foundation);
+    const reviewMock = vi.mocked(FoundationReviewerAgent.prototype.review);
+
+    reviewMock.mockReset();
+    reviewMock.mockResolvedValue({
+      passed: false,
+      totalScore: 72,
+      dimensions: [],
+      overallFeedback: "仍未达到可开写标准。",
+    });
+
+    try {
+      await (runner as unknown as {
+        generateAndReviewFoundation: (params: {
+          readonly generate: (reviewFeedback?: string) => Promise<typeof foundation>;
+          readonly reviewer: FoundationReviewerAgent;
+          readonly mode: "original";
+          readonly language: "zh";
+          readonly stageLanguage: "zh";
+        }) => Promise<typeof foundation>;
+      }).generateAndReviewFoundation({
+        generate,
+        reviewer,
+        mode: "original",
+        language: "zh",
+        stageLanguage: "zh",
+      });
+
+      expect(generate).toHaveBeenCalledTimes(5);
+      expect(reviewMock).toHaveBeenCalledTimes(5);
+      expect(generate.mock.calls[1]?.[0]).toContain("仍未达到可开写标准");
+      expect(generate.mock.calls[4]?.[0]).toContain("仍未达到可开写标准");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("bootstraps missing control documents for legacy books before writing", async () => {
     const { root, runner, bookId } = await createRunnerFixture();
 
@@ -457,7 +669,7 @@ describe("PipelineRunner", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
   it("cleans staged files when initBook fails before foundation is complete", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-init-rollback-"));
@@ -468,8 +680,7 @@ describe("PipelineRunner", () => {
         stream: false,
         defaults: {
           temperature: 0.7,
-          maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
         },
       } as ConstructorParameters<typeof PipelineRunner>[0]["client"],
       model: "test-model",
@@ -514,8 +725,70 @@ describe("PipelineRunner", () => {
       writeFile(join(state.bookDir(bookId), "story", "pending_hooks.md"), "# Pending Hooks\n\n- Why the mentor vanished after the trial.\n", "utf-8"),
     ]);
 
-    const planChapter = vi.spyOn(PlannerAgent.prototype, "planChapter");
-    const composeChapter = vi.spyOn(ComposerAgent.prototype, "composeChapter");
+    const planChapter = vi.spyOn(PlannerAgent.prototype, "planChapter").mockImplementation(async (input) => {
+      const runtimeDir = join(input.bookDir, "story", "runtime");
+      await mkdir(runtimeDir, { recursive: true });
+      const goal = "Ignore the guild chase and bring focus back to mentor conflict.";
+      const memo = {
+        chapter: input.chapterNumber,
+        goal,
+        isGoldenOpening: true,
+        body: "",
+        threadRefs: [] as string[],
+      };
+      const intentMarkdown = [
+        "# Chapter Intent",
+        "",
+        "## Goal",
+        goal,
+        "",
+        "## Outline Node",
+        "Track the merchant guild trail.",
+        "",
+        "## Must Keep",
+        "- Lin Yue still hides the broken oath token.",
+        "",
+        "## Must Avoid",
+        "- none",
+        "",
+        "## Style Emphasis",
+        "- none",
+        "",
+        "## Conflicts",
+        "- outline_vs_request: allow local outline deferral",
+        "",
+        "## Chapter Brief",
+        "- chapterType: confrontation",
+        "- isGoldenOpening: true",
+        "",
+        "### Beat Outline",
+        "- opening: Open on the conflict.",
+        "",
+        "### Hook Plan",
+        "- none",
+        "",
+        "### Props And Setting",
+        "- broken oath token",
+        "",
+      ].join("\n");
+      const runtimePath = join(runtimeDir, `chapter-${String(input.chapterNumber).padStart(4, "0")}.intent.md`);
+      await writeFile(runtimePath, intentMarkdown, "utf-8");
+      return {
+        intent: {
+          chapter: input.chapterNumber,
+          goal,
+          outlineNode: "Track the merchant guild trail.",
+          mustKeep: ["Lin Yue still hides the broken oath token."],
+          mustAvoid: [],
+          styleEmphasis: [],
+        },
+        memo,
+        intentMarkdown,
+        plannerInputs: [runtimePath],
+        runtimePath,
+      };
+    });
+    const composeChapter = vi.spyOn(ComposerModule, "composeGovernedChapter");
     const writeChapter = vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
       createWriterOutput({
         chapterNumber: 1,
@@ -525,16 +798,19 @@ describe("PipelineRunner", () => {
     );
 
     try {
-      await runner.writeDraft(bookId, "Ignore the guild chase and bring focus back to mentor conflict.");
+      const chapterContext = "Ignore the guild chase and bring focus back to mentor conflict.";
+      await runner.writeDraft(bookId, chapterContext);
 
       expect(planChapter).toHaveBeenCalledTimes(1);
       expect(composeChapter).toHaveBeenCalledTimes(1);
 
       const writeInput = writeChapter.mock.calls[0]?.[0];
-      expect(writeInput?.externalContext).toBeUndefined();
+      expect(writeInput?.externalContext).toBe(chapterContext);
       expect(writeInput?.chapterIntent).toContain("# Chapter Intent");
+      expect(writeInput?.chapterMemo).toEqual(expect.objectContaining({
+        chapter: 1,
+      }));
       expect(writeInput?.contextPackage?.selectedContext.length).toBeGreaterThan(0);
-      expect(writeInput?.ruleStack?.activeOverrides).toHaveLength(1);
 
       const runtimeDir = join(state.bookDir(bookId), "story", "runtime");
       await expect(stat(join(runtimeDir, "chapter-0001.intent.md"))).resolves.toBeTruthy();
@@ -581,6 +857,19 @@ describe("PipelineRunner", () => {
           "## Conflicts",
           "- outline_vs_request: allow local outline deferral",
           "",
+          "## Chapter Brief",
+          "- chapterType: confrontation",
+          "- isGoldenOpening: true",
+          "",
+          "### Beat Outline",
+          "- opening: Open on the conflict.",
+          "",
+          "### Hook Plan",
+          "- none",
+          "",
+          "### Props And Setting",
+          "- broken oath token",
+          "",
           "## Pending Hooks Snapshot",
           "- none",
           "",
@@ -604,10 +893,10 @@ describe("PipelineRunner", () => {
     try {
       await runner.writeDraft(bookId);
 
-      expect(planChapter).not.toHaveBeenCalled();
+      expect(planChapter).toHaveBeenCalledTimes(0);
       const writeInput = writeChapter.mock.calls[0]?.[0];
+      expect(writeInput?.chapterIntent).toBeDefined();
       expect(writeInput?.chapterIntent).toContain("Bring the focus back to the mentor conflict.");
-      expect(writeInput?.ruleStack?.activeOverrides).toHaveLength(1);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -834,6 +1123,7 @@ describe("PipelineRunner", () => {
       const result = await runner.writeDraft(bookId);
 
       expect(result.chapterNumber).toBe(1);
+      console.log("DEBUG warnings:", JSON.stringify(warnings, null, 2));
       expect(warnings).toContain(
         "当前 Node 运行时不支持 SQLite 记忆索引，继续使用 Markdown 回退方案。",
       );
@@ -1110,8 +1400,21 @@ describe("PipelineRunner", () => {
       writeFile(join(state.bookDir(bookId), "story", "pending_hooks.md"), "# Pending Hooks\n\n- Why the mentor vanished after the trial.\n", "utf-8"),
     ]);
 
-    const planChapter = vi.spyOn(PlannerAgent.prototype, "planChapter");
-    const composeChapter = vi.spyOn(ComposerAgent.prototype, "composeChapter");
+    const originalPlanChapter = PlannerAgent.prototype.planChapter;
+    const planChapter = vi.spyOn(PlannerAgent.prototype, "planChapter").mockImplementation(async function (this: PlannerAgent, input) {
+      const result = await originalPlanChapter.call(this, input);
+      return {
+        ...result,
+        memo: {
+          chapter: input.chapterNumber,
+          goal: result.intent.goal,
+          isGoldenOpening: true,
+          body: "",
+          threadRefs: [],
+        },
+      };
+    });
+    const composeChapter = vi.spyOn(ComposerModule, "composeGovernedChapter");
     const writeChapter = vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
       createWriterOutput({
         chapterNumber: 1,
@@ -1134,7 +1437,56 @@ describe("PipelineRunner", () => {
       expect(composeChapter).toHaveBeenCalledTimes(1);
       const writeInput = writeChapter.mock.calls[0]?.[0];
       expect(writeInput?.chapterIntent).toContain("# Chapter Intent");
+      expect(writeInput?.externalContext).toBeUndefined();
+      expect(writeInput?.chapterMemo).toEqual(expect.objectContaining({
+        chapter: 1,
+      }));
       expect(writeInput?.contextPackage?.selectedContext.length).toBeGreaterThan(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("passes configured writeNextChapter context through planner and governed writer input", async () => {
+    const chapterContext = "本章标题：雨夜账本\n必须围绕账本失窃后的当面对质展开。";
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      inputGovernanceMode: "v2",
+      externalContext: chapterContext,
+    });
+
+    await Promise.all([
+      writeFile(join(state.bookDir(bookId), "story", "current_focus.md"), "# Current Focus\n\nBring focus back to the mentor conflict.\n", "utf-8"),
+      writeFile(join(state.bookDir(bookId), "story", "volume_outline.md"), "# Volume Outline\n\n## Chapter 1\nTrack the merchant guild trail.\n", "utf-8"),
+      writeFile(join(state.bookDir(bookId), "story", "current_state.md"), "# Current State\n\n- Lin Yue still hides the broken oath token.\n", "utf-8"),
+      writeFile(join(state.bookDir(bookId), "story", "story_bible.md"), "# Story Bible\n\n- The jade seal cannot be destroyed.\n", "utf-8"),
+      writeFile(join(state.bookDir(bookId), "story", "pending_hooks.md"), "# Pending Hooks\n\n- Why the mentor vanished after the trial.\n", "utf-8"),
+    ]);
+
+    const planChapter = vi.spyOn(PlannerAgent.prototype, "planChapter");
+    vi.spyOn(ComposerModule, "composeGovernedChapter");
+    const writeChapter = vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
+      createWriterOutput({
+        chapterNumber: 1,
+        title: "雨夜账本",
+        content: "Governed pipeline draft.",
+        wordCount: "Governed pipeline draft.".length,
+      }),
+    );
+    vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(
+      createAuditResult({
+        passed: true,
+        issues: [],
+        summary: "clean",
+      }),
+    );
+
+    try {
+      await runner.writeNextChapter(bookId, 220);
+
+      expect(planChapter.mock.calls[0]?.[0].externalContext).toBe(chapterContext);
+      const writeInput = writeChapter.mock.calls[0]?.[0];
+      expect(writeInput?.externalContext).toBe(chapterContext);
+      expect(writeInput?.chapterMemo?.goal).toBe(chapterContext);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1194,7 +1546,67 @@ describe("PipelineRunner", () => {
       ),
     ]);
 
-    const planChapter = vi.spyOn(PlannerAgent.prototype, "planChapter");
+    const planChapter = vi.spyOn(PlannerAgent.prototype, "planChapter").mockImplementation(async (input) => {
+      const rDir = join(input.bookDir, "story", "runtime");
+      await mkdir(rDir, { recursive: true });
+      const goal = "Track the merchant guild trail.";
+      const intentMd = [
+        "# Chapter Intent",
+        "",
+        "## Goal",
+        goal,
+        "",
+        "## Outline Node",
+        "(not found)",
+        "",
+        "## Must Keep",
+        "- none",
+        "",
+        "## Must Avoid",
+        "- none",
+        "",
+        "## Style Emphasis",
+        "- none",
+        "",
+        "## Conflicts",
+        "- none",
+        "",
+        "## Chapter Brief",
+        "- chapterType: 推进",
+        "- isGoldenOpening: false",
+        "",
+        "### Beat Outline",
+        "- opening: test",
+        "",
+        "### Hook Plan",
+        "- none",
+        "",
+        "### Props And Setting",
+        "- none",
+        "",
+      ].join("\n");
+      const runtimePath = join(rDir, `chapter-${String(input.chapterNumber).padStart(4, "0")}.intent.md`);
+      await writeFile(runtimePath, intentMd, "utf-8");
+      return {
+        intent: {
+          chapter: input.chapterNumber,
+          goal,
+          mustKeep: [],
+          mustAvoid: [],
+          styleEmphasis: [],
+        },
+        memo: {
+          chapter: input.chapterNumber,
+          goal,
+          isGoldenOpening: false,
+          body: "",
+          threadRefs: [],
+        },
+        intentMarkdown: intentMd,
+        plannerInputs: [runtimePath],
+        runtimePath,
+      };
+    });
     const writeChapter = vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
       createWriterOutput({
         chapterNumber: 1,
@@ -1489,6 +1901,7 @@ describe("PipelineRunner", () => {
           passed: false,
           issues: [CRITICAL_ISSUE],
           summary: "needs revision",
+          overallScore: 40,
         }),
       )
       .mockResolvedValueOnce(
@@ -1496,6 +1909,7 @@ describe("PipelineRunner", () => {
           passed: true,
           issues: [],
           summary: "clean",
+          overallScore: 95,
         }),
       );
     vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockResolvedValue(
@@ -1530,71 +1944,49 @@ describe("PipelineRunner", () => {
 
   it("normalizes revised output once before re-audit when it leaves the target band", async () => {
     const { root, runner, bookId } = await createRunnerFixture();
-    const writerDraft = "中段正文。".repeat(40);
-    const overlongRevision = "修订后正文。".repeat(60);
-    const normalizedRevision = "归一正文。".repeat(40);
+    const overlongDraft = "修订后正文。".repeat(60);
+    const normalizedDraft = "归一正文。".repeat(40);
 
     vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
       createWriterOutput({
-        content: writerDraft,
-        wordCount: writerDraft.length,
+        content: overlongDraft,
+        wordCount: overlongDraft.length,
       }),
     );
-    const auditChapter = vi.spyOn(ContinuityAuditor.prototype, "auditChapter")
-      .mockResolvedValueOnce(
-        createAuditResult({
-          passed: false,
-          issues: [CRITICAL_ISSUE],
-          summary: "needs revision",
-        }),
-      )
-      .mockResolvedValueOnce(
-        createAuditResult({
-          passed: true,
-          issues: [],
-          summary: "clean",
-        }),
-      );
-    const reviseChapter = vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockResolvedValue(
-      createReviseOutput({
-        revisedContent: overlongRevision,
-        wordCount: overlongRevision.length,
+    vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(
+      createAuditResult({
+        passed: true,
+        issues: [],
+        summary: "clean",
       }),
     );
     const normalizeChapter = vi.mocked(
       LengthNormalizerAgent.prototype.normalizeChapter,
     ).mockResolvedValue({
-      normalizedContent: normalizedRevision,
-      finalCount: normalizedRevision.length,
+      normalizedContent: normalizedDraft,
+      finalCount: normalizedDraft.length,
       applied: true,
       mode: "compress",
       tokenUsage: ZERO_USAGE,
     });
     vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(
       createAnalyzedOutput({
-        content: normalizedRevision,
-        wordCount: normalizedRevision.length,
+        content: normalizedDraft,
+        wordCount: normalizedDraft.length,
       }),
     );
 
     try {
       await runner.writeNextChapter(bookId, 220);
 
-      expect(reviseChapter.mock.calls[0]?.[6]).toMatchObject({
-        lengthSpec: expect.objectContaining({
-          target: 220,
-          softMin: 190,
-          softMax: 250,
-        }),
-      });
-      expect(normalizeChapter).toHaveBeenCalledTimes(1);
+      // v9: normalization happens once before the scoring loop, not after revision
+      expect(normalizeChapter).toHaveBeenCalled();
       expect(normalizeChapter.mock.calls[0]?.[0]).toMatchObject({
-        chapterContent: overlongRevision,
+        chapterContent: overlongDraft,
         lengthSpec: expect.objectContaining({
           target: 220,
         }),
       });
-      expect(auditChapter.mock.calls[1]?.[1]).toBe(normalizedRevision);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1641,8 +2033,43 @@ describe("PipelineRunner", () => {
     try {
       await runner.writeNextChapter(bookId, 220);
 
-      expect(normalizeChapter).toHaveBeenCalledTimes(1);
+      expect(normalizeChapter).toHaveBeenCalled();
       expect(auditChapter.mock.calls[0]?.[1]).toBe(normalizedDraft);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not normalize minor soft-range length drift", async () => {
+    const { root, runner, bookId } = await createRunnerFixture();
+    const nearTargetDraft = "近".repeat(260);
+
+    vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
+      createWriterOutput({
+        chapterNumber: 1,
+        content: nearTargetDraft,
+        wordCount: nearTargetDraft.length,
+      }),
+    );
+    const normalizeChapter = vi.mocked(
+      LengthNormalizerAgent.prototype.normalizeChapter,
+    );
+    const auditChapter = vi.spyOn(
+      ContinuityAuditor.prototype,
+      "auditChapter",
+    ).mockResolvedValue(
+      createAuditResult({
+        passed: true,
+        issues: [],
+        summary: "clean",
+      }),
+    );
+
+    try {
+      await runner.writeNextChapter(bookId, 220);
+
+      expect(normalizeChapter).not.toHaveBeenCalled();
+      expect(auditChapter.mock.calls[0]?.[1]).toBe(nearTargetDraft);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1689,7 +2116,7 @@ describe("PipelineRunner", () => {
     try {
       await runner.writeNextChapter(bookId, 220);
 
-      expect(normalizeChapter).toHaveBeenCalledTimes(1);
+      expect(normalizeChapter).toHaveBeenCalled();
       expect(normalizeChapter.mock.calls[0]?.[0]).toMatchObject({
         chapterContent: shortDraft,
         lengthSpec: expect.objectContaining({
@@ -1744,7 +2171,7 @@ describe("PipelineRunner", () => {
       const chapterIndex = await state.loadChapterIndex(bookId);
       const chapterMeta = chapterIndex.find((entry) => entry.number === 1);
 
-      expect(normalizeChapter).toHaveBeenCalledTimes(1);
+      expect(normalizeChapter).toHaveBeenCalled();
       expect((result as { lengthWarnings?: ReadonlyArray<string> }).lengthWarnings?.[0]).toContain(
         "超出硬区间",
       );
@@ -1834,7 +2261,7 @@ describe("PipelineRunner", () => {
     });
 
     const planChapter = vi.spyOn(PlannerAgent.prototype, "planChapter");
-    const composeChapter = vi.spyOn(ComposerAgent.prototype, "composeChapter");
+    const composeChapter = vi.spyOn(ComposerModule, "composeGovernedChapter");
     const writeChapter = vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
       createWriterOutput({
         chapterNumber: 1,
@@ -1859,7 +2286,7 @@ describe("PipelineRunner", () => {
     }
   });
 
-  it("uses the latest revised content as the input for follow-up spot-fix revisions", async () => {
+  it("feeds postWriteErrors into the scoring loop as extra issues", async () => {
     const { root, runner, bookId } = await createRunnerFixture();
 
     vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
@@ -1876,41 +2303,125 @@ describe("PipelineRunner", () => {
         ],
       }),
     );
+    // First audit: postWriteErrors make it fail even though LLM says passed
+    // Second audit (after repair): clean
     vi.spyOn(ContinuityAuditor.prototype, "auditChapter")
       .mockResolvedValueOnce(createAuditResult({
-        passed: false,
-        issues: [CRITICAL_ISSUE],
-        summary: "needs another revision",
+        passed: true,
+        overallScore: 88,
+        issues: [],
+        summary: "LLM thinks clean but postWriteErrors will override",
       }))
       .mockResolvedValueOnce(createAuditResult({
         passed: true,
+        overallScore: 92,
         issues: [],
-        summary: "clean",
+        summary: "clean after fix",
       }));
     const reviseChapter = vi.spyOn(ReviserAgent.prototype, "reviseChapter")
       .mockResolvedValueOnce(createReviseOutput({
-        revisedContent: "After first fix.",
-        wordCount: "After first fix.".length,
-      }))
-      .mockResolvedValueOnce(createReviseOutput({
-        revisedContent: "After second fix.",
-        wordCount: "After second fix.".length,
+        revisedContent: "After auto fix.",
+        wordCount: "After auto fix.".length,
       }));
     vi.spyOn(WriterAgent.prototype, "saveChapter").mockResolvedValue(undefined);
     vi.spyOn(WriterAgent.prototype, "saveNewTruthFiles").mockResolvedValue(undefined);
     vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(
       createAnalyzedOutput({
-        content: "After second fix.",
-        wordCount: "After second fix.".length,
+        content: "After auto fix.",
+        wordCount: "After auto fix.".length,
       }),
     );
 
     await runner.writeNextChapter(bookId);
 
-    expect(reviseChapter).toHaveBeenCalledTimes(2);
-    expect(reviseChapter.mock.calls[1]?.[1]).toBe("After first fix.");
+    // Reviser called via scoring loop (auto mode), not pre-audit spot-fix
+    expect(reviseChapter).toHaveBeenCalled();
+    expect(reviseChapter.mock.calls[0]?.[4]).toBe("auto");
 
     await rm(root, { recursive: true, force: true });
+  });
+
+  it("runs at most one automatic repair iteration during writeNextChapter", async () => {
+    const { root, runner, bookId } = await createRunnerFixture();
+    const draftBody = "甲".repeat(220);
+    const revisedBody = "乙".repeat(220);
+
+    vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
+      createWriterOutput({
+        content: draftBody,
+        wordCount: draftBody.length,
+      }),
+    );
+    const auditChapter = vi.spyOn(ContinuityAuditor.prototype, "auditChapter")
+      .mockResolvedValueOnce(createAuditResult({
+        passed: false,
+        overallScore: 40,
+        issues: [CRITICAL_ISSUE],
+        summary: "needs repair",
+      }))
+      .mockResolvedValueOnce(createAuditResult({
+        passed: false,
+        overallScore: 50,
+        issues: [CRITICAL_ISSUE],
+        summary: "still weak",
+      }))
+      .mockResolvedValueOnce(createAuditResult({
+        passed: false,
+        overallScore: 60,
+        issues: [CRITICAL_ISSUE],
+        summary: "should not be reached",
+      }));
+    const reviseChapter = vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockResolvedValue(
+      createReviseOutput({
+        revisedContent: revisedBody,
+        wordCount: revisedBody.length,
+      }),
+    );
+    vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(
+      createAnalyzedOutput({
+        content: revisedBody,
+        wordCount: revisedBody.length,
+      }),
+    );
+
+    try {
+      const result = await runner.writeNextChapter(bookId, 220);
+
+      expect(result.status).toBe("audit-failed");
+      expect(auditChapter).toHaveBeenCalledTimes(2);
+      expect(reviseChapter).toHaveBeenCalledTimes(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not run the prose polisher automatically after a passing write", async () => {
+    const { root, runner, bookId } = await createRunnerFixture();
+    const draftBody = "林".repeat(220);
+
+    vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
+      createWriterOutput({
+        content: draftBody,
+        wordCount: draftBody.length,
+      }),
+    );
+    vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(
+      createAuditResult({
+        passed: true,
+        issues: [],
+        summary: "clean",
+        overallScore: 90,
+      }),
+    );
+    const polishChapter = vi.spyOn(PolisherAgent.prototype, "polishChapter");
+
+    try {
+      await runner.writeNextChapter(bookId, 220);
+
+      expect(polishChapter).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("persists truth files derived from the final revised chapter", async () => {
@@ -1937,13 +2448,21 @@ describe("PipelineRunner", () => {
         ],
       }),
     );
-    vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(
-      createAuditResult({
+    // First audit: postWriteErrors force passed=false, score 40 triggers loop
+    // Second audit: after repair, passes
+    vi.spyOn(ContinuityAuditor.prototype, "auditChapter")
+      .mockResolvedValueOnce(createAuditResult({
         passed: true,
+        overallScore: 40,
         issues: [],
-        summary: "clean",
-      }),
-    );
+        summary: "postWriteErrors will override passed",
+      }))
+      .mockResolvedValueOnce(createAuditResult({
+        passed: true,
+        overallScore: 95,
+        issues: [],
+        summary: "clean after fix",
+      }));
     vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockResolvedValue(
       createReviseOutput({
         revisedContent: "Final revised body.",
@@ -2218,11 +2737,10 @@ describe("PipelineRunner", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it("does not persist chapter files or index entries when state validation errors before save", async () => {
+  it("degrades to state-degraded when state validation errors instead of aborting", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture({
       inputGovernanceMode: "legacy",
     });
-    const chaptersDir = join(state.bookDir(bookId), "chapters");
 
     vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
       createWriterOutput({
@@ -2241,9 +2759,13 @@ describe("PipelineRunner", () => {
       new Error("LLM returned empty response"),
     );
 
-    await expect(runner.writeNextChapter(bookId)).rejects.toThrow("LLM returned empty response");
-    await expect(readdir(chaptersDir)).resolves.toEqual([]);
-    await expect(state.loadChapterIndex(bookId)).resolves.toEqual([]);
+    const result = await runner.writeNextChapter(bookId);
+    expect(result.status).toBe("state-degraded");
+
+    // Chapter should be saved (content is fine, only truth files are degraded)
+    const index = await state.loadChapterIndex(bookId);
+    expect(index).toHaveLength(1);
+    expect(index[0]!.status).toBe("state-degraded");
 
     await rm(root, { recursive: true, force: true });
   });
@@ -2598,6 +3120,13 @@ describe("PipelineRunner", () => {
         tokenUsage: ZERO_USAGE,
       }),
     );
+    vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockImplementation(
+      async (_bookDir, chapterContent) =>
+        createReviseOutput({
+          revisedContent: chapterContent,
+          wordCount: chapterContent.length,
+        }),
+    );
 
     const { root, runner, state, bookId } = await createRunnerFixture({
       inputGovernanceMode: "legacy",
@@ -2673,6 +3202,7 @@ describe("PipelineRunner", () => {
           passed: false,
           issues: [CRITICAL_ISSUE],
           summary: "needs revision",
+          overallScore: 40,
         }),
       )
       .mockResolvedValueOnce(
@@ -2680,6 +3210,7 @@ describe("PipelineRunner", () => {
           passed: true,
           issues: [],
           summary: "clean",
+          overallScore: 95,
         }),
       );
     vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockResolvedValue(
@@ -2807,6 +3338,23 @@ describe("PipelineRunner", () => {
       expect(await state.loadChapterIndex(bookId)).toEqual([]);
       await expect(readFile(join(state.bookDir(bookId), "story", "fanfic_canon.md"), "utf-8")).resolves.toContain("Fanfic Canon");
       await expect(stat(join(state.bookDir(bookId), "story", "snapshots", "0"))).resolves.toBeTruthy();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("imports short style samples with a deterministic guide instead of failing", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    const chatSpy = vi.spyOn(llmProvider, "chatCompletion").mockRejectedValue(new Error("should not call llm for short samples"));
+    const sample = "夜雨落在窗台。她没回头，只把那封信压进抽屉。楼下车灯一闪，像有人终于找到了这里。";
+
+    try {
+      const guide = await runner.generateStyleGuide(bookId, sample, "short-snippet");
+
+      expect(chatSpy).not.toHaveBeenCalled();
+      expect(guide).toContain("样本文本较短");
+      await expect(readFile(join(state.bookDir(bookId), "story", "style_profile.json"), "utf-8")).resolves.toContain("short-snippet");
+      await expect(readFile(join(state.bookDir(bookId), "story", "style_guide.md"), "utf-8")).resolves.toContain("样本文本较短");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -3750,6 +4298,7 @@ describe("PipelineRunner", () => {
           passed: false,
           issues: [CRITICAL_ISSUE],
           summary: "needs revision",
+          overallScore: 40,
         }),
       )
       .mockResolvedValueOnce(
@@ -3757,6 +4306,7 @@ describe("PipelineRunner", () => {
           passed: true,
           issues: [],
           summary: "clean",
+          overallScore: 95,
         }),
       );
     vi.spyOn(ReviserAgent.prototype, "reviseChapter").mockResolvedValue(
@@ -3913,7 +4463,7 @@ describe("PipelineRunner", () => {
     }
   });
 
-  it("defaults manual reviseDraft to spot-fix when mode is omitted", async () => {
+  it("defaults manual reviseDraft to auto when mode is omitted", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture();
     const storyDir = join(state.bookDir(bookId), "story");
     const chaptersDir = join(state.bookDir(bookId), "chapters");
@@ -3966,7 +4516,7 @@ describe("PipelineRunner", () => {
       await runner.reviseDraft(bookId, 1);
 
       expect(reviseChapter).toHaveBeenCalledTimes(1);
-      expect(reviseChapter.mock.calls[0]?.[4]).toBe("spot-fix");
+      expect(reviseChapter.mock.calls[0]?.[4]).toBe("auto");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -4234,7 +4784,7 @@ describe("PipelineRunner", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
   it("persists manual revisions only when merged audit improves", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture();
@@ -4315,7 +4865,7 @@ describe("PipelineRunner", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
   it("re-audits revisions against updated state overrides instead of stale on-disk truth files", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture();
@@ -4431,7 +4981,7 @@ describe("PipelineRunner", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
   it("excludes pure sequence-level fatigue from revision blocker counts", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture();

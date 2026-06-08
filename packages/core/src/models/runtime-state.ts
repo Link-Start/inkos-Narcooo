@@ -34,6 +34,18 @@ export const HookRecordSchema = z.object({
   expectedPayoff: z.string().default(""),
   payoffTiming: HookPayoffTimingSchema.optional(),
   notes: z.string().default(""),
+  // Phase 7 — hook causality / promotion metadata.
+  // All optional so hooks parsed from pre-Phase-7 markdown still validate
+  // and so callers constructing HookRecord inline can omit them.
+  dependsOn: z.array(z.string().min(1)).optional(),
+  paysOffInArc: z.string().optional(),
+  coreHook: z.boolean().optional(),
+  halfLifeChapters: z.number().int().positive().optional(),
+  advancedCount: z.number().int().min(0).optional(),
+  // Phase 7 hotfix 2 — promotion flag. Undefined on legacy 11/12-column
+  // ledgers; architect-seed and consolidator-rerun both populate it going
+  // forward. Reviewer uses it to gate critical severity for stale hooks.
+  promoted: z.boolean().optional(),
 });
 
 export type HookRecord = z.infer<typeof HookRecordSchema>;

@@ -7,6 +7,7 @@ import {
   StateManifestSchema,
   type ChapterSummariesState,
   type CurrentStateState,
+  type HooksState,
   type HookStatus,
   type StateManifest,
 } from "../models/runtime-state.js";
@@ -216,14 +217,16 @@ async function loadOrBootstrapHooks(params: {
   readonly forceBootstrapFromMarkdown?: boolean;
 }) {
   if (!params.forceBootstrapFromMarkdown) {
-    const existing = await loadJsonIfValid(
+    const existing = await loadHooksStateIfValid(
       params.statePath,
-      HooksStateSchema,
       params.warnings,
       "hooks.json",
     );
     if (existing) {
-      return existing;
+      if (existing.repaired) {
+        await writeFile(params.statePath, JSON.stringify(existing.state, null, 2), "utf-8");
+      }
+      return existing.state;
     }
   }
 
@@ -289,7 +292,7 @@ function parsePendingHooksStateMarkdown(markdown: string, warnings: string[]) {
           return {
             hookId,
             startChapter: parseStrictIntegerWithWarning(row[1], warnings, `${hookId}:startChapter`),
-            type: row[2] ?? "unspecified",
+            type: normalizeHookType(row[2], warnings, hookId),
             status: normalizeHookStatus(row[3], warnings, hookId),
             lastAdvancedChapter: parseStrictIntegerWithWarning(row[4], warnings, `${hookId}:lastAdvancedChapter`),
             expectedPayoff: row[5] ?? "",
@@ -417,6 +420,64 @@ async function loadJsonIfValid<T>(
   }
 }
 
+async function loadHooksStateIfValid(
+  path: string,
+  warnings: string[],
+  fileLabel: string,
+): Promise<{ readonly state: HooksState; readonly repaired: boolean } | null> {
+  try {
+    const raw = await readFile(path, "utf-8");
+    const repaired = repairHooksStateInput(JSON.parse(raw), warnings);
+    return {
+      state: HooksStateSchema.parse(repaired.value),
+      repaired: repaired.changed,
+    };
+  } catch (error) {
+    const message = String(error);
+    if (!/ENOENT/.test(message)) {
+      appendWarning(warnings, `${fileLabel} invalid, rebuilt from markdown`);
+    }
+    return null;
+  }
+}
+
+function repairHooksStateInput(value: unknown, warnings: string[]): { readonly value: unknown; readonly changed: boolean } {
+  if (!isRecord(value) || !Array.isArray(value.hooks)) {
+    return { value, changed: false };
+  }
+
+  let changed = false;
+  const hooks = value.hooks.map((hook, index) => {
+    if (!isRecord(hook)) return hook;
+    const hookId = typeof hook.hookId === "string" && hook.hookId.trim()
+      ? hook.hookId.trim()
+      : `hooks[${index}]`;
+    if (typeof hook.type === "string" && hook.type.trim().length > 0) {
+      if (hook.type === hook.type.trim()) {
+        return hook;
+      }
+      changed = true;
+      return { ...hook, type: hook.type.trim() };
+    }
+
+    changed = true;
+    appendWarning(warnings, `${hookId}: empty hook type normalized to "unspecified"`);
+    return {
+      ...hook,
+      type: "unspecified",
+    };
+  });
+
+  return {
+    value: changed ? { ...value, hooks } : value,
+    changed,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 async function loadMarkdownBootstrapState(params: {
   readonly bookDir: string;
   readonly storyDir: string;
@@ -534,6 +595,13 @@ function normalizeHookStatus(value: string | undefined, warnings: string[], hook
   if (/(open|pending|待定|未回收)/i.test(normalized)) return "open";
   appendWarning(warnings, `${hookId}:status normalized from "${value ?? ""}" to "open"`);
   return "open";
+}
+
+function normalizeHookType(value: string | undefined, warnings: string[], hookId: string): string {
+  const normalized = (value ?? "").trim();
+  if (normalized) return normalized;
+  appendWarning(warnings, `${hookId}: empty hook type normalized to "unspecified"`);
+  return "unspecified";
 }
 
 function parseStrictIntegerWithWarning(value: string | undefined, warnings: string[], fieldLabel: string): number {

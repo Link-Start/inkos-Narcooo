@@ -9,6 +9,38 @@ interface TruthFile {
   readonly name: string;
   readonly size: number;
   readonly preview: string;
+  readonly legacy?: boolean;
+}
+
+// Phase 5 hotfix: shim files are read-only — point users at the
+// authoritative outline/* path so edits actually land where the runtime
+// reads them.
+export const SHIM_AUTHORITATIVE_PATH: Readonly<Record<string, string>> = {
+  "story_bible.md": "outline/story_frame.md",
+  "book_rules.md": "outline/story_frame.md",
+};
+
+/**
+ * Phase hotfix 2: when the GET response carries `legacy: true`, the file is
+ * a Phase 5 compat shim. The UI must hide the Edit button and surface a
+ * warning pointing at the authoritative outline path. This helper centralizes
+ * the rule so it's unit-testable without a DOM.
+ */
+export interface FilePresentation {
+  readonly canEdit: boolean;
+  readonly legacy: boolean;
+  readonly authoritativePath: string | null;
+}
+
+export function deriveFilePresentation(
+  fileName: string | null,
+  fileData: { content: string | null; legacy?: boolean } | null | undefined,
+): FilePresentation {
+  const legacy = fileData?.legacy === true;
+  const authoritativePath = fileName ? SHIM_AUTHORITATIVE_PATH[fileName] ?? null : null;
+  // Edit only makes sense when we actually have content AND it's not a shim.
+  const canEdit = !!fileName && !!fileData && fileData.content != null && !legacy;
+  return { canEdit, legacy, authoritativePath };
 }
 
 interface Nav {
@@ -23,9 +55,12 @@ export function TruthFiles({ bookId, nav, theme, t }: { bookId: string; nav: Nav
   const [editMode, setEditMode] = useState(false);
   const [editText, setEditText] = useState("");
   const [savingEdit, setSavingEdit] = useState(false);
-  const { data: fileData, refetch: refetchFile } = useApi<{ file: string; content: string | null }>(
+  const { data: fileData, refetch: refetchFile } = useApi<{ file: string; content: string | null; legacy?: boolean }>(
     selected ? `/books/${bookId}/truth/${selected}` : "",
   );
+
+  const presentation = deriveFilePresentation(selected, fileData);
+  const isLegacyShim = presentation.legacy;
 
   const startEdit = () => {
     setEditText(fileData?.content ?? "");
@@ -92,6 +127,20 @@ export function TruthFiles({ bookId, nav, theme, t }: { bookId: string; nav: Nav
         <div className={`border ${c.cardStatic} rounded-lg p-5 min-h-[400px] flex flex-col`}>
           {selected && fileData?.content != null ? (
             <>
+              {isLegacyShim && (
+                <div
+                  data-testid="legacy-shim-warning"
+                  className="mb-3 px-3 py-2 rounded-md border border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs leading-relaxed"
+                >
+                  <div className="font-medium">兼容层只读 / Read-only compat shim</div>
+                  <div className="mt-1">
+                    本文件已废弃，仅供外部读取。权威来源：
+                    <code className="ml-1 px-1 py-0.5 rounded bg-background/40 font-mono">
+                      {SHIM_AUTHORITATIVE_PATH[selected] ?? "outline/"}
+                    </code>
+                  </div>
+                </div>
+              )}
               <div className="flex items-center justify-end gap-2 mb-3">
                 {editMode ? (
                   <>
@@ -112,13 +161,15 @@ export function TruthFiles({ bookId, nav, theme, t }: { bookId: string; nav: Nav
                     </button>
                   </>
                 ) : (
-                  <button
-                    onClick={startEdit}
-                    className={`inline-flex items-center gap-1 px-3 py-1.5 text-xs rounded-md ${c.btnSecondary}`}
-                  >
-                    <Pencil size={14} />
-                    Edit
-                  </button>
+                  !isLegacyShim && (
+                    <button
+                      onClick={startEdit}
+                      className={`inline-flex items-center gap-1 px-3 py-1.5 text-xs rounded-md ${c.btnSecondary}`}
+                    >
+                      <Pencil size={14} />
+                      Edit
+                    </button>
+                  )
                 )}
               </div>
               {editMode ? (

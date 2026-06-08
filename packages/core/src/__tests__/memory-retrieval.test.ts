@@ -1211,136 +1211,93 @@ describe("parsePendingHooksMarkdown", () => {
     ]);
   });
 
-  it("sorts must-advance by stalest-first and resolve by earliest-started", () => {
-    const agenda = memoryRetrieval.buildPlannerHookAgenda({
-      chapterNumber: 18,
-      hooks: [
-        {
-          hookId: "slow-oath",
-          startChapter: 10,
-          type: "relationship",
-          status: "progressing",
-          lastAdvancedChapter: 17,
-          expectedPayoff: "Reveal why the mentor buried the oath debt",
-          payoffTiming: "slow-burn",
-          notes: "The debt should simmer across the wider arc.",
-        },
-        {
-          hookId: "ready-packet",
-          startChapter: 14,
-          type: "mystery",
-          status: "progressing",
-          lastAdvancedChapter: 17,
-          expectedPayoff: "Open the missing packet and expose the inside hand",
-          payoffTiming: "near-term",
-          notes: "The local sequence is ready for a concrete payoff.",
-        },
-      ] as never,
-      maxMustAdvance: 2,
-      maxEligibleResolve: 2,
-      targetChapters: 40,
-    } as never);
+});
 
-    expect(agenda.mustAdvance).toContain("slow-oath");
-    expect(agenda.mustAdvance).toContain("ready-packet");
-    expect(agenda.eligibleResolve).toContain("slow-oath");
-    expect(agenda.eligibleResolve).toContain("ready-packet");
-    expect(agenda.pressureMap).toEqual([]);
+// ---------------------------------------------------------------------------
+// Phase 9-2 — computeRecyclableHooks unit tests
+// ---------------------------------------------------------------------------
+
+import { computeRecyclableHooks } from "../utils/memory-retrieval.js";
+import type { StoredHook } from "../state/memory-db.js";
+
+function makeHook(overrides: Partial<StoredHook> & Pick<StoredHook, "hookId">): StoredHook {
+  return {
+    startChapter: 1,
+    type: "foreshadow",
+    status: "open",
+    lastAdvancedChapter: 0,
+    expectedPayoff: "",
+    notes: "",
+    ...overrides,
+  };
+}
+
+describe("computeRecyclableHooks", () => {
+  it("returns empty array when no hooks are stale", () => {
+    const hooks = [
+      makeHook({ hookId: "H1", startChapter: 8, lastAdvancedChapter: 9, status: "pressured" }),
+      makeHook({ hookId: "H2", startChapter: 9, lastAdvancedChapter: 0, status: "open" }),
+    ];
+    expect(computeRecyclableHooks(hooks, 10)).toEqual([]);
   });
 
-  it("limits eligible resolve to default max of 1 when not overridden", () => {
-    const agenda = memoryRetrieval.buildPlannerHookAgenda({
-      chapterNumber: 8,
-      targetChapters: 12,
-      hooks: [
-        {
-          hookId: "packet-drop",
-          startChapter: 5,
-          type: "mystery",
-          status: "progressing",
-          lastAdvancedChapter: 7,
-          expectedPayoff: "Open the dropped packet and expose who planted it",
-          payoffTiming: "near-term",
-          notes: "The packet has been foregrounded for two chapters already.",
-        },
-        {
-          hookId: "seal-crack",
-          startChapter: 4,
-          type: "artifact",
-          status: "progressing",
-          lastAdvancedChapter: 7,
-          expectedPayoff: "Reveal what the cracked seal is hiding",
-          payoffTiming: "immediate",
-          notes: "The cracked seal should pay off in the current local sequence.",
-        },
-        {
-          hookId: "witness-turn",
-          startChapter: 5,
-          type: "relationship",
-          status: "progressing",
-          lastAdvancedChapter: 7,
-          expectedPayoff: "Force the silent witness to choose a side",
-          payoffTiming: "near-term",
-          notes: "The witness line is ready for a concrete turn now.",
-        },
-      ] as never,
-    } as never);
-
-    expect(agenda.eligibleResolve.length).toBe(1);
-    expect(agenda.pressureMap).toEqual([]);
+  it("flags pressured hooks silent ≥ 5 chapters", () => {
+    const hooks = [
+      makeHook({ hookId: "H1", startChapter: 3, lastAdvancedChapter: 4, status: "pressured" }),
+      makeHook({ hookId: "H2", startChapter: 9, lastAdvancedChapter: 9, status: "pressured" }),
+    ];
+    const result = computeRecyclableHooks(hooks, 10);
+    expect(result.map((h) => h.hookId)).toEqual(["H1"]);
   });
 
-  it("picks stalest hooks for must-advance regardless of type family", () => {
-    const agenda = memoryRetrieval.buildPlannerHookAgenda({
-      chapterNumber: 15,
-      targetChapters: 30,
-      hooks: [
-        {
-          hookId: "mentor-oath-a",
-          startChapter: 1,
-          type: "relationship",
-          status: "open",
-          lastAdvancedChapter: 2,
-          expectedPayoff: "Explain the first layer of the mentor oath debt",
-          payoffTiming: "mid-arc",
-          notes: "Old relationship debt keeps surfacing without movement.",
-        },
-        {
-          hookId: "mentor-oath-b",
-          startChapter: 2,
-          type: "relationship",
-          status: "open",
-          lastAdvancedChapter: 3,
-          expectedPayoff: "Show what the second oath witness is hiding",
-          payoffTiming: "mid-arc",
-          notes: "Another branch of the same relationship family is also stale.",
-        },
-        {
-          hookId: "mentor-oath-c",
-          startChapter: 3,
-          type: "relationship",
-          status: "open",
-          lastAdvancedChapter: 4,
-          expectedPayoff: "Reveal why the oath cannot be spoken aloud",
-          payoffTiming: "mid-arc",
-          notes: "The third relationship branch is still hanging.",
-        },
-        {
-          hookId: "kiln-key",
-          startChapter: 4,
-          type: "artifact",
-          status: "open",
-          lastAdvancedChapter: 5,
-          expectedPayoff: "Show what the kiln key unlocks",
-          payoffTiming: "mid-arc",
-          notes: "Artifact debt is also stale and should not vanish behind relationship debt.",
-        },
-      ] as never,
-    } as never);
+  it("flags near_payoff hooks silent ≥ 5 chapters", () => {
+    const hooks = [
+      makeHook({ hookId: "H1", startChapter: 3, lastAdvancedChapter: 4, status: "near_payoff" }),
+    ];
+    const result = computeRecyclableHooks(hooks, 10);
+    expect(result.map((h) => h.hookId)).toEqual(["H1"]);
+  });
 
-    expect(agenda.mustAdvance).toEqual(["mentor-oath-a", "mentor-oath-b"]);
-    expect(agenda.mustAdvance).toEqual(expect.arrayContaining([
-      expect.stringMatching(/^mentor-oath-/),
-    ]));
+  it("flags core hooks silent ≥ 8 chapters (not 10)", () => {
+    const hooks = [
+      makeHook({ hookId: "H-core", startChapter: 2, lastAdvancedChapter: 2, status: "open", coreHook: true }),
+      makeHook({ hookId: "H-regular", startChapter: 2, lastAdvancedChapter: 2, status: "open" }),
+    ];
+    // silence = 10 - 2 = 8. core: qualifies (>=8). regular: does not (<10).
+    const result = computeRecyclableHooks(hooks, 10);
+    expect(result.map((h) => h.hookId)).toEqual(["H-core"]);
+  });
+
+  it("flags plain open hooks only when silent ≥ 10 chapters", () => {
+    const hooks = [
+      makeHook({ hookId: "H1", startChapter: 1, lastAdvancedChapter: 0, status: "open" }),
+    ];
+    expect(computeRecyclableHooks(hooks, 10).map((h) => h.hookId)).toEqual([]);
+    expect(computeRecyclableHooks(hooks, 11).map((h) => h.hookId)).toEqual(["H1"]);
+  });
+
+  it("excludes resolved / deferred hooks regardless of silence", () => {
+    const hooks = [
+      makeHook({ hookId: "H1", startChapter: 1, lastAdvancedChapter: 1, status: "resolved" }),
+      makeHook({ hookId: "H2", startChapter: 1, lastAdvancedChapter: 1, status: "deferred" }),
+    ];
+    expect(computeRecyclableHooks(hooks, 20)).toEqual([]);
+  });
+
+  it("excludes future-planted hooks that have not yet landed", () => {
+    const hooks = [
+      makeHook({ hookId: "H1", startChapter: 30, lastAdvancedChapter: 0, status: "open" }),
+    ];
+    expect(computeRecyclableHooks(hooks, 10)).toEqual([]);
+  });
+
+  it("sorts by silence DESC — most overdue hook first", () => {
+    const hooks = [
+      makeHook({ hookId: "H-mid", startChapter: 2, lastAdvancedChapter: 4, status: "pressured" }),
+      makeHook({ hookId: "H-worst", startChapter: 1, lastAdvancedChapter: 1, status: "pressured" }),
+      makeHook({ hookId: "H-mild", startChapter: 3, lastAdvancedChapter: 5, status: "pressured" }),
+    ];
+    const result = computeRecyclableHooks(hooks, 10);
+    expect(result.map((h) => h.hookId)).toEqual(["H-worst", "H-mid", "H-mild"]);
   });
 });

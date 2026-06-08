@@ -1,4 +1,4 @@
-import type { Platform } from "@actalk/inkos-core";
+import { normalizePlatformOrOther, type Platform } from "@actalk/inkos-core";
 
 export interface StudioCreateBookBody {
   readonly title: string;
@@ -7,6 +7,7 @@ export interface StudioCreateBookBody {
   readonly platform?: string;
   readonly chapterWordCount?: number;
   readonly targetChapters?: number;
+  readonly blurb?: string;
 }
 
 export interface StudioBookConfigDraft {
@@ -36,14 +37,7 @@ interface WaitForStudioBookReadyOptions {
 }
 
 export function normalizeStudioPlatform(platform?: string): Platform {
-  switch (platform) {
-    case "tomato":
-    case "feilu":
-    case "qidian":
-      return platform;
-    default:
-      return "other";
-  }
+  return normalizePlatformOrOther(platform);
 }
 
 export function buildStudioBookConfig(body: StudioCreateBookBody, now: string): StudioBookConfigDraft {
@@ -83,7 +77,7 @@ export async function waitForStudioBookReady(
   const retryDelayMs = options.retryDelayMs ?? 150;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const response = await fetchImpl(`/api/books/${encodeURIComponent(bookId)}`);
+    const response = await fetchImpl(`/api/v1/books/${encodeURIComponent(bookId)}`);
     if (response.ok) {
       return await response.json() as StudioBookDetail;
     }

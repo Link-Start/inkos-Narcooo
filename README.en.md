@@ -3,13 +3,14 @@
   <img src="assets/inkos-text.svg" width="240" height="65" alt="InkOS">
 </p>
 
-<h1 align="center">Autonomous Novel Writing CLI AI Agent</h1>
+<h1 align="center">Autonomous Novel Writing AI Agent</h1>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@actalk/inkos"><img src="https://img.shields.io/npm/v/@actalk/inkos.svg?color=cb3837&logo=npm" alt="npm version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL%20v3-blue.svg" alt="License: AGPL-3.0"></a>
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg" alt="Node.js"></a>
-  <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/badge/TypeScript-5.x-3178C6.svg?logo=typescript&logoColor=white" alt="TypeScript"></a>
+  <a href="https://github.com/Narcooo/inkos/stargazers"><img src="https://img.shields.io/github/stars/Narcooo/inkos?style=flat&logo=github&color=yellow" alt="GitHub stars"></a>
+  <a href="https://www.npmjs.com/package/@actalk/inkos"><img src="https://img.shields.io/npm/dm/@actalk/inkos?color=cb3837&logo=npm&label=downloads" alt="npm downloads"></a>
+  <a href="https://clawhub.ai/narcooo/inkos"><img src="https://img.shields.io/badge/🦞%20ClawHub-Skill-FF6B35?labelColor=1a1a1a" alt="ClawHub Skill"></a>
 </p>
 
 <p align="center">
@@ -18,9 +19,15 @@
 
 ---
 
-Open-source CLI AI Agent that autonomously writes, audits, and revises novels — with human review gates that keep you in control. Supports LitRPG, Progression Fantasy, Isekai, Romantasy, Sci-Fi, and more. Continuation, spinoff, fanfic, and style imitation workflows built in.
+Open-source AI Agent that autonomously writes, audits, and revises novels — with human review gates that keep you in control. Supports LitRPG, Progression Fantasy, Isekai, Romantasy, Sci-Fi, and more. Continuation, spinoff, fanfic, and style imitation workflows built in.
 
-**InkOS Studio is here!** — run `inkos studio` to launch a local web workbench. Book management, chapter review & editing, real-time writing progress, market radar, analytics, AI detection, style analysis, genre management, daemon control, truth file editing — everything the CLI does, now visual.
+**InkOS Studio 2.0 is here!** — run `inkos` to launch the local web workbench. Book management, chapter review & editing, real-time writing progress, market radar, analytics, AI detection, style analysis, genre management, daemon control, truth file editing — everything the CLI does, now visual.
+
+**InkOS TUI is here!** — run `inkos tui` to launch a full-screen interactive dashboard. Conversational creation, natural-language book operations, slash command autocomplete, themed animations — TUI, Studio, and OpenClaw share the same interaction kernel.
+
+**InkOS Short** — Studio chat and CLI can now create a standalone short-fiction package: complete draft, outline and review records, synopsis, selling points, cover prompt, and an optional generated cover image when a cover provider is configured.
+
+**v1.4.1 Windows provider and long-form speed update** — MiniMax now uses its OpenAI-compatible endpoint by default, long-form writing keeps the faster one-pass repair default while allowing `writing.reviewRetries` to be raised when needed, and the short-fiction / Studio Chat workflow from v1.4 remains available.
 
 **Native English novel writing now supported！** — 10 built-in English genre profiles with dedicated pacing rules, fatigue word lists, and audit dimensions. Set `--lang en` and go.
 
@@ -42,7 +49,21 @@ clawhub install inkos          # Install from ClawHub
 
 If you installed via npm or cloned the repo, `skills/SKILL.md` is already included — 🦞 can read it directly without a separate ClawHub install.
 
-Once installed, Claw can invoke InkOS atomic commands and control-surface operations (`plan chapter`/`compose chapter`/`draft`/`audit`/`revise`/`write next`) via `exec`, with `--json` output for structured decision-making. The recommended flow is: update `author_intent.md` or `current_focus.md`, run `plan` / `compose`, then decide whether to call `draft` or the full `write next` pipeline. You can also browse it on [ClawHub](https://clawhub.ai) by searching `inkos`.
+Once installed, Claw should prefer the shared interaction entry:
+
+```bash
+inkos interact --json --message "continue the current book, but keep the pacing tighter"
+```
+
+This routes through the same conversation executor used by the project TUI, so OpenClaw, TUI, and Studio stay on the same control brain. The JSON payload includes:
+- parsed request
+- assistant response text
+- updated interaction session
+- execution state
+- pending decision
+- recent events
+
+Atomic commands (`plan chapter` / `compose chapter` / `draft` / `audit` / `revise` / `write next`) are still available, but they are now lower-level tools rather than the preferred OpenClaw entry. You can also browse it on [ClawHub](https://clawhub.ai) by searching `inkos`.
 
 ### Configure
 
@@ -102,19 +123,18 @@ inkos config show-models        # View current routing
 
 Agents without explicit overrides fall back to the global model.
 
-### v1 Update
+### v1.2 Update
 
-**InkOS Studio + Writing Pipeline Overhaul**
+**Unified Interaction Kernel + TUI Dashboard + Studio Assistant**
 
-- **InkOS Studio** (v1.0): `inkos studio` launches a local web workbench (Vite + React + Hono). Book management, chapter review & editing, real-time writing progress, market radar, analytics, AI detection, style analysis, genre management, daemon control, truth file editing — everything the CLI does, now visual
-- **Foundation Reviewer** (v1.1): independent review agent at book creation, 5-dimension scoring (canon DNA, new narrative space, core conflict, opening pacing, pacing viability), auto-reject below 80
-- **Hook Seed Excerpt** (v1.1): when resolving hooks, Composer extracts original seed scene excerpts into Writer context so payoff scenes are grounded in concrete narrative
-- **Review Reject Rollback** (v1.1): `inkos review reject` rolls back state to the pre-chapter snapshot, discards downstream chapters and memory index
-- **State Validation Recovery** (v1.1): auto-retries settler on state validation failure, degrades gracefully if still failing, `inkos write repair-state` for manual recovery
-- **Bilingual Import** (v1.1.1): `import chapters` and `fanfic init` support bilingual prompts, auto-detect continuation vs series mode
-- **Chapter Number Anchoring** (v1.1): chapter progress anchored to contiguous durable files only — narrative numbers no longer pollute progress
-- Audit drift isolation, title collapse repair, hook budget hints, chapter ending trail, mood/pacing monotony detection
-- Bilingual AI-tells and sensitive word lists, custom HTTP headers (`INKOS_LLM_HEADERS`)
+- **Shared Interaction Runtime**: TUI, Studio, `inkos interact`, and OpenClaw Skill share a single NL understanding + execution kernel, supporting 15+ intents (write, revise, rewrite, rename, export, switch book, etc.)
+- **Ink TUI Dashboard**: `inkos` launches a full-screen interactive dashboard (Ink + React) with conversational creation, slash command autocomplete, themed animations, and bilingual i18n
+- **Studio Assistant Panel**: right-side AI assistant panel connects to the shared interaction kernel — natural language book operations (rename, write, audit, export) with real-time execution status
+- **Conversational Book Creation**: brainstorm book settings through natural language dialogue, one-click create when draft is ready
+- **Book-wide Entity Rename**: `rename Lin Jin to Zhang San` or `/rename Lin Jin => Zhang San` — scans all chapters + truth files in one pass
+- **`inkos interact`**: shared interaction JSON endpoint for OpenClaw / external agent integration
+- **Thinking Model Temperature Clamp**: kimi-k2.5 and similar thinking models auto-clamped to temperature=1, compatible with per-call temperature overrides
+- **Studio Dead Code Cleanup**: removed unused shadcn components and dependencies, -2800 lines
 
 ### Write Your First Book
 
@@ -130,6 +150,37 @@ inkos export my-book --format epub  # Export EPUB (read on phone/Kindle)
 ```
 
 Language is set per-genre by default. Override explicitly with `--lang en` or `--lang zh`. Use `inkos genre list` to see all available genres and their default languages.
+
+### Write Complete Short Fiction
+
+In Studio chat, ask for a complete short-fiction deliverable:
+
+```text
+Write a 12-chapter short fiction piece about a modern marriage reversal where the heroine wins with hard evidence.
+```
+
+Or run it from the CLI:
+
+```bash
+inkos short run \
+  --direction "modern short fiction marriage reversal evidence-driven heroine" \
+  --chapters 12 \
+  --chars 1000
+```
+
+Outputs are saved under `shorts/<story-name>/final/`, including `full.md`, `sales-package.md`, `cover-prompt.md`, and `cover.png` when cover generation is configured.
+
+### Generate a Standalone Cover
+
+To generate only a cover for an existing title or synopsis, do not rerun the short-fiction pipeline. Ask Studio chat directly:
+
+```text
+Generate a short-fiction cover for "The Divorce Papers He Regretted", modern city, high-drama reversal.
+```
+
+The cover tool writes `covers/<title>/cover-prompt.md` and `covers/<title>/cover.png`. If no cover provider is configured yet, set the cover provider and API key in Studio model settings first.
+
+After generation, you can keep editing the cover prompt through chat, for example: "move the character closer, make the title text bigger, and give her a colder smile." InkOS will pass the revised direction as `coverPrompt`, rewrite `cover-prompt.md`, and regenerate the cover without rewriting the story.
 
 <p align="center">
   <img src="assets/screenshot-terminal.png" width="700" alt="Terminal screenshot">
@@ -164,7 +215,7 @@ Every genre includes a **fatigue word list** (e.g., "delve", "tapestry", "testam
 
 ### 33-Dimension Audit + De-AI-ification
 
-The Continuity Auditor agent checks every draft across 33 dimensions: character memory, resource continuity, hook payoff, outline adherence, narrative pacing, emotional arcs, and more. Built-in AI-tell detection automatically catches "LLM voice" — overused words, monotonous sentence patterns, excessive summarization. Failed audits trigger an automatic revision loop.
+The Continuity Auditor agent checks every draft across 33 dimensions: character memory, resource continuity, hook payoff, outline adherence, narrative pacing, emotional arcs, and more. Built-in AI-tell detection automatically catches "LLM voice" — overused words, monotonous sentence patterns, excessive summarization. The default long-form write cycle now runs at most one automatic revision pass; unresolved critical findings are kept in the result for human review or later commands.
 
 De-AI-ification rules are baked into the Writer agent's prompts: fatigue word lists, banned patterns, style fingerprint injection — reducing AI traces at the source. `revise --mode anti-detect` runs dedicated anti-detection rewriting on existing chapters.
 
@@ -190,7 +241,7 @@ inkos plan chapter my-book --context "Pull attention back to the mentor conflict
 inkos compose chapter my-book
 ```
 
-This generates `story/runtime/chapter-XXXX.intent.md`, `context.json`, `rule-stack.yaml`, and `trace.json`. `intent.md` is the human-readable contract; the others are execution/debug artifacts. `plan` / `compose` only compile local documents and state, so they can run before you finish API key setup.
+This generates `story/runtime/chapter-XXXX.intent.md`, `context.json`, `rule-stack.yaml`, and `trace.json`. `intent.md` is the human-readable contract; the others are execution/debug artifacts. `plan` calls the LLM to produce the chapter intent; `compose` only compiles local documents and state, so it can run before you finish API key setup.
 
 ### Length Governance
 
@@ -244,15 +295,15 @@ Each chapter is produced by multiple agents in sequence, with zero human interve
 | **Radar** | Scans platform trends and reader preferences to inform story direction (pluggable, skippable) |
 | **Planner** | Reads author intent + current focus + memory retrieval results, produces chapter intent (must-keep / must-avoid) |
 | **Composer** | Selects relevant context from all truth files by relevance, compiles rule stack and runtime artifacts |
-| **Architect** | Plans chapter structure: outline, scene beats, pacing targets |
+| **Architect** | Generates foundation files during book creation, import, or spinoff setup: story frame, rules, characters, and long-horizon control files |
 | **Writer** | Produces prose from the composed context (length-governed, dialogue-driven) |
 | **Observer** | Over-extracts 9 categories of facts from the chapter text (characters, locations, resources, relationships, emotions, information, hooks, time, physical state) |
 | **Reflector** | Outputs a JSON delta (not full markdown); code-layer applies Zod schema validation then immutable write |
-| **Normalizer** | Single-pass compress/expand to bring chapter length into the target band |
+| **Normalizer** | Single-pass compress/expand only when the chapter clearly leaves the hard length range |
 | **Continuity Auditor** | Validates the draft against 7 canonical truth files, 33-dimension check |
-| **Reviser** | Fixes issues found by the auditor — auto-fixes critical problems, flags others for human review |
+| **Reviser** | Fixes critical issues found by the auditor; the default write cycle runs at most one automatic revision pass and flags the rest for human review |
 
-If the audit fails, the pipeline automatically enters a revise → re-audit loop until all critical issues are resolved.
+If the audit fails, the default pipeline runs one revise → re-audit pass. Remaining issues are preserved in the result and state for human review or later commands.
 
 ### Canonical Truth Files
 
@@ -375,7 +426,7 @@ inkos agent "Create a progression fantasy about a mage who can only use one spel
 | `inkos studio` | Start web workbench (`-p` for port, default 4567) |
 | `inkos up / down` | Start/stop daemon (`-q` quiet mode, auto-writes `inkos.log`) |
 
-`[id]` is auto-detected when the project has only one book. All commands support `--json` for structured output. `draft` / `write next` / `plan chapter` / `compose chapter` accept `--context` for steering, and `--words` overrides the target chapter size. `book create` supports `--brief <file>` to pass a creative brief — the Architect builds from your ideas instead of generating from scratch. `plan chapter` / `compose chapter` do not require a live LLM, so you can inspect governed inputs before finishing API setup.
+`[id]` is auto-detected when the project has only one book. All commands support `--json` for structured output. `draft` / `write next` / `plan chapter` / `compose chapter` accept `--context` for steering, and `--words` overrides the target chapter size. `book create` supports `--brief <file>` to pass a creative brief — the Architect builds from your ideas instead of generating from scratch. `plan chapter` calls the LLM to create chapter intent; `compose chapter` does not require a live LLM, so you can inspect governed inputs before finishing API setup.
 
 ## Roadmap
 
@@ -406,6 +457,16 @@ pnpm typecheck    # Type-check without emitting
    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Narcooo/inkos&type=date&legend=top-left" />
  </picture>
 </a>
+
+## Skills Download History
+
+<div align="center">
+
+<a href="https://skill-history.com/narcooo/inkos">
+  <img alt="Skills Download History" src="https://skill-history.com/chart/narcooo/inkos.svg" />
+</a>
+
+</div>
 
 ## Repobeats
 

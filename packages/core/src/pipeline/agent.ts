@@ -1,7 +1,8 @@
 import { chatWithTools, type AgentMessage, type ToolDefinition } from "../llm/provider.js";
 import { PipelineRunner, type PipelineConfig } from "./runner.js";
-import type { Platform, Genre } from "../models/book.js";
+import { normalizePlatformOrOther, type Genre } from "../models/book.js";
 import { DEFAULT_REVISE_MODE, type ReviseMode } from "../agents/reviser.js";
+import { deriveBookIdFromTitle } from "../utils/book-id.js";
 
 /** Tool definitions for the agent loop. */
 const TOOLS: ReadonlyArray<ToolDefinition> = [
@@ -205,12 +206,12 @@ const TOOLS: ReadonlyArray<ToolDefinition> = [
   },
   {
     name: "write_truth_file",
-    description: "【整文件覆盖】直接替换书的真相文件内容。用于扩展大纲、修改世界观、调整规则。注意：这是整文件覆盖写入，不是追加；不要用来改 current_state.md 的章节进度指针或 hack 章节号；不要用来补空章节。",
+    description: "【整文件覆盖】直接替换书的真相文件内容。用于扩展大纲、修改世界观、调整规则。注意：这是整文件覆盖写入，不是追加；不要用来改 current_state.md 的章节进度指针或 hack 章节号；不要用来补空章节。book_rules.md / story_bible.md 是 Phase 5 之后的兼容指针，不再作为写入目标——请改写 outline/story_frame.md 的 YAML frontmatter。",
     parameters: {
       type: "object",
       properties: {
         bookId: { type: "string", description: "书籍ID" },
-        fileName: { type: "string", description: "文件名（如 volume_outline.md、story_bible.md、book_rules.md、current_state.md、pending_hooks.md）" },
+        fileName: { type: "string", description: "文件名（如 outline/story_frame.md、outline/volume_map.md、outline/节奏原则.md（可选，Phase 5 后节奏原则合并到 volume_map 尾段，仅 legacy / 人工写入时出现）、roles/主要角色/<name>.md、roles/次要角色/<name>.md、current_state.md、pending_hooks.md）" },
         content: { type: "string", description: "新的完整文件内容" },
       },
       required: ["bookId", "fileName", "content"],
@@ -420,16 +421,12 @@ export async function executeAgentTool(
     case "create_book": {
       const now = new Date().toISOString();
       const title = args.title as string;
-      const bookId = title
-        .toLowerCase()
-        .replace(/[^a-z0-9\u4e00-\u9fff]/g, "-")
-        .replace(/-+/g, "-")
-        .slice(0, 30);
+      const bookId = deriveBookIdFromTitle(title) || `book-${Date.now().toString(36)}`;
 
       const book = {
         id: bookId,
         title,
-        platform: ((args.platform as string) ?? "tomato") as Platform,
+        platform: normalizePlatformOrOther(args.platform ?? "tomato"),
         genre: ((args.genre as string) ?? "xuanhuan") as Genre,
         status: "outlining" as const,
         targetChapters: 200,
@@ -563,16 +560,69 @@ export async function executeAgentTool(
       const fileName = args.fileName as string;
       const content = args.content as string;
 
-      // Whitelist allowed truth files
-      const ALLOWED_FILES = [
-        "story_bible.md", "volume_outline.md", "book_rules.md",
+      // Whitelist allowed truth files.
+      //
+      // Hotfix: story_bible.md and book_rules.md are back in the whitelist —
+      // they are authoritative for pre-Phase-5 books. For new-layout books
+      // (outline/story_frame.md exists) they're compat shims and writes are
+      // blocked below.
+      const LEGACY_SHIM_FILES = new Set(["story_bible.md", "book_rules.md"]);
+      const ALLOWED_FLAT_FILES = [
+        "story_bible.md", "book_rules.md",
         "current_state.md", "particle_ledger.md", "pending_hooks.md",
         "chapter_summaries.md", "subplot_board.md", "emotional_arcs.md",
         "character_matrix.md", "style_guide.md",
       ];
+      // outline/节奏原则.md (zh) / outline/rhythm_principles.md (en) are
+      // optional after Phase 5 consolidation — rhythm principles normally live
+      // in the last paragraph of volume_map and writeFoundationFiles skips the
+      // dedicated file when the block is empty. They remain whitelisted so
+      // legacy books and manual overrides keep working.
+      const ALLOWED_OUTLINE_FILES = [
+        "outline/story_frame.md", "outline/volume_map.md",
+        "outline/节奏原则.md", "outline/rhythm_principles.md",
+      ];
+      // Phase hotfix 3: accept both locale dirs so English-layout books can
+      // be edited via write_truth_file. The reader (utils/outline-paths.ts)
+      // and Studio (server.ts) accept both — the agent whitelist must match.
+      const ROLE_PATH_PATTERN = /^roles\/(主要角色|次要角色|major|minor)\/[^/]+\.md$/;
 
-      if (!ALLOWED_FILES.includes(fileName)) {
-        return JSON.stringify({ error: `不允许修改文件 "${fileName}"。允许的文件：${ALLOWED_FILES.join(", ")}` });
+      const isAllowed =
+        ALLOWED_FLAT_FILES.includes(fileName)
+        || ALLOWED_OUTLINE_FILES.includes(fileName)
+        || ROLE_PATH_PATTERN.test(fileName);
+
+      if (!isAllowed) {
+        const allowedExamples = [
+          ...ALLOWED_FLAT_FILES,
+          ...ALLOWED_OUTLINE_FILES,
+          "roles/主要角色/<name>.md",
+          "roles/次要角色/<name>.md",
+          "roles/major/<name>.md",
+          "roles/minor/<name>.md",
+        ];
+        return JSON.stringify({
+          error:
+            `不允许修改文件 "${fileName}"。允许的文件：${allowedExamples.join(", ")}`,
+        });
+      }
+
+      // For new-layout books, story_bible.md / book_rules.md are shims —
+      // block writes so the agent edits outline/story_frame.md instead.
+      if (LEGACY_SHIM_FILES.has(fileName)) {
+        const { isNewLayoutBook } = await import("../utils/outline-paths.js");
+        const bookDirForCheck = new (await import("../state/manager.js")).StateManager(config.projectRoot).bookDir(bookId);
+        if (await isNewLayoutBook(bookDirForCheck)) {
+          return JSON.stringify({
+            error: `"${fileName}" 是兼容指针（新布局书籍），请改写 outline/story_frame.md。`,
+          });
+        }
+      }
+
+      // Path traversal guard — the whitelist already forbids `..`, but we
+      // re-assert at the write site so this cannot regress.
+      if (fileName.includes("..") || fileName.startsWith("/") || fileName.includes("\0")) {
+        return JSON.stringify({ error: `不安全的文件路径："${fileName}"` });
       }
 
       // Guard: block chapter progress manipulation via current_state.md
@@ -581,11 +631,12 @@ export async function executeAgentTool(
       }
 
       const { writeFile, mkdir } = await import("node:fs/promises");
-      const { join } = await import("node:path");
+      const { join, dirname } = await import("node:path");
       const bookDir = new (await import("../state/manager.js")).StateManager(config.projectRoot).bookDir(bookId);
       const storyDir = join(bookDir, "story");
-      await mkdir(storyDir, { recursive: true });
-      await writeFile(join(storyDir, fileName), content, "utf-8");
+      const targetPath = join(storyDir, fileName);
+      await mkdir(dirname(targetPath), { recursive: true });
+      await writeFile(targetPath, content, "utf-8");
 
       return JSON.stringify({
         bookId,

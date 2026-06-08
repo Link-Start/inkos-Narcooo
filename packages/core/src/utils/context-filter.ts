@@ -7,6 +7,38 @@
 
 import { DEFAULT_CHAPTER_CADENCE_WINDOW } from "./chapter-cadence.js";
 
+export interface ContextCapOptions {
+  readonly label: string;
+  readonly maxChars: number;
+  readonly headRatio?: number;
+}
+
+/**
+ * Cap a large context block while keeping the durable setup at the beginning
+ * and the latest tail. This prevents long-running books from sending full truth
+ * files every chapter while still making the omission visible to the model.
+ */
+export function capContextBlock(content: string, options: ContextCapOptions): string {
+  if (!content || content === "(文件尚未创建)") return content;
+
+  const maxChars = Math.floor(options.maxChars);
+  if (maxChars <= 0) return "";
+  if (content.length <= maxChars) return content;
+
+  const omitted = content.length - maxChars;
+  const note = `\n\n[InkOS context budget: omitted about ${omitted} chars from ${options.label}; kept beginning and latest tail.]\n\n`;
+  if (maxChars <= note.length + 2) {
+    return content.slice(0, maxChars);
+  }
+
+  const keepChars = maxChars - note.length;
+  const headRatio = clampRatio(options.headRatio ?? 0.45);
+  const headChars = Math.max(1, Math.floor(keepChars * headRatio));
+  const tailChars = Math.max(1, keepChars - headChars);
+
+  return `${content.slice(0, headChars)}${note}${content.slice(-tailChars)}`;
+}
+
 /** Filter pending_hooks: remove resolved/closed hooks. */
 export function filterHooks(hooks: string): string {
   if (!hooks || hooks === "(文件尚未创建)") return hooks;
@@ -110,6 +142,11 @@ function extractNames(text: string): Set<string> {
   }
 
   return names;
+}
+
+function clampRatio(value: number): number {
+  if (!Number.isFinite(value)) return 0.45;
+  return Math.min(0.8, Math.max(0.2, value));
 }
 
 // ---------------------------------------------------------------------------

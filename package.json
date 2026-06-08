@@ -1,6 +1,6 @@
 {
   "name": "inkos",
-  "version": "1.1.1",
+  "version": "1.4.1",
   "private": true,
   "description": "Autonomous AI novel writing CLI agent — 10-agent pipeline that writes, audits, and revises novels with continuity tracking",
   "keywords": [
@@ -22,7 +22,7 @@
   },
   "scripts": {
     "build": "pnpm -r build",
-    "dev": "pnpm -r dev",
+    "dev": "pnpm -r --parallel dev",
     "test": "pnpm -r test",
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
@@ -32,5 +32,11 @@
   "engines": {
     "node": ">=20.0.0",
     "pnpm": ">=9.0.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "@mariozechner/pi-ai": "0.67.1",
+      "@mariozechner/pi-agent-core": "0.67.1"
+    }
   }
 }

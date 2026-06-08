@@ -77,7 +77,10 @@ export async function buildRuntimeStateArtifacts(params: {
     snapshot: next,
     resolvedDelta,
     currentStateMarkdown: renderCurrentStateProjection(next.currentState, params.language),
-    hooksMarkdown: renderHooksProjection(next.hooks, params.language),
+    // Pass the chapter number so the projection can tag stale / blocked hooks.
+    hooksMarkdown: renderHooksProjection(next.hooks, params.language, {
+      currentChapter: resolvedDelta.chapter,
+    }),
     chapterSummariesMarkdown: renderChapterSummariesProjection(next.chapterSummaries, params.language),
   };
 }

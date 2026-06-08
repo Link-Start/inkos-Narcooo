@@ -1,17 +1,40 @@
 import { z } from "zod";
 
+// C1 (v2.0.0 breaking): `maxTokens` 字段已被 providers bank 接管；zod 用 strip mode 静默丢弃老配置里的 `maxTokens`。
+const LLMServiceEntrySchema = z.object({
+  service: z.string().min(1),
+  name: z.string().min(1).optional(),
+  baseUrl: z.string().url().optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  apiFormat: z.enum(["chat", "responses"]).optional(),
+  stream: z.boolean().optional(),
+});
+
+const LLMCoverConfigSchema = z.object({
+  service: z.enum(["kkaiapi", "openai", "google"]),
+  model: z.string().min(1),
+}).optional();
+
+// C1 (v2.0.0 breaking): 删除 maxTokens / maxTokensCap 字段。
+// 每个模型的真实 maxOutput 来自 providers/<name>.ts 的 InkosModel.maxOutput；
+// 老配置里写的 maxTokens / maxTokensCap 会被 zod strip 静默丢弃（不报错）。
 export const LLMConfigSchema = z.object({
   provider: z.enum(["anthropic", "openai", "custom"]),
+  service: z.string().default("custom"),
+  configSource: z.enum(["env", "studio"]).default("env"),
   baseUrl: z.string().url(),
   apiKey: z.string().default(""),
   model: z.string().min(1),
+  proxyUrl: z.string().url().optional(),
   temperature: z.number().min(0).max(2).default(0.7),
-  maxTokens: z.number().int().min(1).default(8192),
   thinkingBudget: z.number().int().min(0).default(0),
   extra: z.record(z.unknown()).optional(),
   headers: z.record(z.string()).optional(),
   apiFormat: z.enum(["chat", "responses"]).default("chat"),
   stream: z.boolean().default(true),
+  services: z.array(LLMServiceEntrySchema).optional(),
+  defaultModel: z.string().min(1).optional(),
+  cover: LLMCoverConfigSchema,
 });
 
 export type LLMConfig = z.infer<typeof LLMConfigSchema>;
@@ -60,6 +83,18 @@ export const QualityGatesSchema = z.object({
 
 export type QualityGates = z.infer<typeof QualityGatesSchema>;
 
+export const FoundationConfigSchema = z.object({
+  reviewRetries: z.number().int().min(0).max(10).default(2),
+});
+
+export type FoundationConfig = z.infer<typeof FoundationConfigSchema>;
+
+export const WritingConfigSchema = z.object({
+  reviewRetries: z.number().int().min(0).max(10).default(1),
+});
+
+export type WritingConfig = z.infer<typeof WritingConfigSchema>;
+
 export const AgentLLMOverrideSchema = z.object({
   model: z.string().min(1),
   provider: z.enum(["anthropic", "openai", "custom"]).optional(),
@@ -82,6 +117,12 @@ export const ProjectConfigSchema = z.object({
   llm: LLMConfigSchema,
   notify: z.array(NotifyChannelSchema).default([]),
   detection: DetectionConfigSchema.optional(),
+  foundation: FoundationConfigSchema.default({
+    reviewRetries: 2,
+  }),
+  writing: WritingConfigSchema.default({
+    reviewRetries: 1,
+  }),
   modelOverrides: z.record(z.string(), ModelOverrideValueSchema).optional(),
   inputGovernanceMode: InputGovernanceModeSchema.default("v2"),
   daemon: z.object({

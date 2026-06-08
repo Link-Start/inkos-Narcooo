@@ -47,6 +47,8 @@ describe("spot-fix patches", () => {
     ]);
 
     expect(result.applied).toBe(true);
+    expect(result.appliedPatchCount).toBe(1);
+    expect(result.skippedPatchCount).toBe(0);
     expect(result.revisedContent).toBe([
       "门轴轻轻响了一下。",
       "林越先停在门槛外，侧耳听了一息。",
@@ -57,42 +59,46 @@ describe("spot-fix patches", () => {
     ].join("\n"));
   });
 
-  it("rejects patches whose target text is not unique", () => {
-    const original = "他停了一下。\n门里的人也停了一下。";
+  it("skips non-unique patches instead of rejecting all", () => {
+    const original = "他停了一下。\n门里的人也停了一下。\n窗外很静。";
 
     const result = applySpotFixPatches(original, [
-      {
-        targetText: "停了一下",
-        replacementText: "顿了顿",
-      },
+      { targetText: "停了一下", replacementText: "顿了顿" },
+      { targetText: "窗外很静。", replacementText: "窗外传来虫鸣。" },
     ]);
 
-    expect(result.applied).toBe(false);
-    expect(result.revisedContent).toBe(original);
-    expect(result.rejectedReason).toContain("exactly once");
+    expect(result.applied).toBe(true);
+    expect(result.appliedPatchCount).toBe(1);
+    expect(result.skippedPatchCount).toBe(1);
+    expect(result.revisedContent).toContain("窗外传来虫鸣。");
+    expect(result.revisedContent).toContain("停了一下"); // unchanged — patch was skipped
   });
 
-  it("rejects oversized patch sets that touch too much of the chapter", () => {
-    const original = [
-      "第一段很长，需要保留原样。",
-      "第二段也很长，需要保留原样。",
-      "第三段也很长，需要保留原样。",
-      "第四段也很长，需要保留原样。",
-    ].join("\n");
+  it("applies patches via fuzzy match when whitespace differs", () => {
+    const original = "他慢慢站起来，   看了一眼\n远处的山。";
 
     const result = applySpotFixPatches(original, [
       {
-        targetText: [
-          "第一段很长，需要保留原样。",
-          "第二段也很长，需要保留原样。",
-          "第三段也很长，需要保留原样。",
-        ].join("\n"),
-        replacementText: "这里被大段重写了。",
+        targetText: "他慢慢站起来， 看了一眼 远处的山。",
+        replacementText: "他猛地起身，盯着远山。",
       },
     ]);
 
+    expect(result.applied).toBe(true);
+    expect(result.appliedPatchCount).toBe(1);
+    expect(result.revisedContent).toBe("他猛地起身，盯着远山。");
+  });
+
+  it("reports all skipped when no patches can be matched", () => {
+    const original = "完全不相关的内容。";
+
+    const result = applySpotFixPatches(original, [
+      { targetText: "这段不存在", replacementText: "替换" },
+    ]);
+
     expect(result.applied).toBe(false);
-    expect(result.revisedContent).toBe(original);
-    expect(result.rejectedReason).toContain("touch");
+    expect(result.appliedPatchCount).toBe(0);
+    expect(result.skippedPatchCount).toBe(1);
+    expect(result.rejectedReason).toContain("No patches could be matched");
   });
 });

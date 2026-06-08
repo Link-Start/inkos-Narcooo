@@ -2,18 +2,25 @@ import { BaseAgent } from "./base.js";
 import type { GenreProfile } from "../models/genre-profile.js";
 import type { BookRules } from "../models/book-rules.js";
 import type { FanficMode } from "../models/book.js";
-import type { ContextPackage, RuleStack } from "../models/input-governance.js";
+import type { ChapterMemo, ContextPackage, RuleStack } from "../models/input-governance.js";
 import { readGenreProfile, readBookLanguage, readBookRules } from "./rules-reader.js";
 import { getFanficDimensionConfig, FANFIC_DIMENSIONS } from "./fanfic-dimensions.js";
 import { readFile, readdir } from "node:fs/promises";
 import { filterHooks, filterSummaries, filterSubplots, filterEmotionalArcs, filterCharacterMatrix } from "../utils/context-filter.js";
 import { buildGovernedMemoryEvidenceBlocks } from "../utils/governed-context.js";
+import {
+  readVolumeMap,
+  readCharacterContext,
+  readCurrentStateWithFallback,
+} from "../utils/outline-paths.js";
 import { join } from "node:path";
 
 export interface AuditResult {
   readonly passed: boolean;
   readonly issues: ReadonlyArray<AuditIssue>;
   readonly summary: string;
+  /** 0-100 overall quality score. Present when the auditor supports scoring. */
+  readonly overallScore?: number;
   readonly tokenUsage?: {
     readonly promptTokens: number;
     readonly completionTokens: number;
@@ -63,7 +70,7 @@ const DIMENSION_LABELS: Record<number, { readonly zh: string; readonly en: strin
   30: { zh: "世界规则跨书一致性", en: "Cross-Book World Rule Check" },
   31: { zh: "番外伏笔隔离", en: "Spinoff Hook Isolation Check" },
   32: { zh: "读者期待管理", en: "Reader Expectation Check" },
-  33: { zh: "大纲偏离检测", en: "Outline Drift Check" },
+  33: { zh: "章节备忘偏离", en: "Chapter Memo Drift Check" },
   34: { zh: "角色还原度", en: "Character Fidelity Check" },
   35: { zh: "世界规则遵守", en: "World Rule Compliance Check" },
   36: { zh: "关系动态", en: "Relationship Dynamics Check" },
@@ -163,7 +170,54 @@ function buildDimensionNote(
     }
   }
 
+  // v10: Enhanced dimension notes with writing methodology awareness
+  if (id === 7) {
+    return language === "en"
+      ? "Check pacing rhythm: Do the recent 3-5 chapters form a complete mini-goal cycle (build-up → escalation → climax → aftermath)? If 5+ consecutive chapters pass without a climax (payoff/reward/reversal), flag as pacing stagnation. If the previous chapter was a climax/big reversal, does this chapter show change (relationships shifted, status changed, costs paid)? If it jumps straight to new build-up without showing impact, flag as 'post-climax impact missing'. Daily/transition scenes must carry at least one task: plant a hook, advance a relationship, set up contrast, or prepare the next cycle."
+      : "检查节奏波形：最近 3-5 章是否形成了完整的「蓄压→升级→爆发→后效」周期？如果连续 5 章没有爆发（兑现/回报/翻转），标记为节奏停滞。如果上一章是爆发/高潮/大反转，本章是否写出了改变？如果直接跳到新蓄压而没有展示前一波爆发的影响，标记为「高潮后影响缺失」。非冲突章节中的日常/过渡/对话段落，是否至少承担了一项任务：埋伏笔、推关系、建立反差、准备下一轮蓄压。纯水日常标记为流水账风险。";
+  }
+
+  if (id === 15) {
+    const base = gp.satisfactionTypes.length > 0
+      ? (language === "en" ? `Payoff types: ${gp.satisfactionTypes.join(", ")}. ` : `爽点类型：${gp.satisfactionTypes.join("、")}。`)
+      : "";
+    return language === "en"
+      ? `${base}Check desire engine: Has the chapter created an emotional gap (reader wants release) OR delivered a payoff that exceeds expectations? A payoff that only satisfies 70% of built-up anticipation counts as diluted. If this chapter is in the aftermath phase of a mini-goal cycle, verify that consequences are shown — not just emotional reactions, but concrete changes to status, relationships, or resources.`
+      : `${base}检查欲望驱动：本章是否制造了情绪缺口（读者渴望释放）或完成了超出预期的兑现？只满足读者70%期待的兑现等于爽点虚化。如果本章处于小目标周期的后效阶段，检查是否展示了具体改变——不只是情绪反应，而是地位、关系或资源的实际变化。`;
+  }
+
+  if (id === 25) {
+    return language === "en"
+      ? "Cross-check character behavior against the 3-question test: (1) Why does the character do this? (2) Does it match their established profile? (3) Would a reader who only read prior chapters find it jarring? Also check if character's emotional state progresses or stagnates."
+      : "人设三问检查：(1)角色为什么这么做？(2)符合之前建立的人设吗？(3)只看过前面章节的读者会觉得突兀吗？同时检查角色情绪弧线是否在推进还是停滞。";
+  }
+
   switch (id) {
+    case 6:
+      // Phase 7 — hook-debt escalation. Reviewer now reads pending_hooks.md
+      // not just for "is this hook undelivered" but for causal/temporal
+      // debt escalation. The ledger's status column carries "过期 (距=…/半衰=…)"
+      // and "受阻于 …" markers emitted by the stale/blocked detector; this
+      // dimension tells the reviewer how to escalate them.
+      return language === "en"
+        ? `Hook-debt escalation (Phase 7 + hotfixes 2/3). Read the pending_hooks.md ledger and escalate based on the stale / blocked / core_hook / depends_on / promoted columns, NOT only on "undelivered hook present":
+
+• Critical severity only applies to hooks with promoted=true in the ledger. A stale/blocked non-promoted hook stays at info — the promotion flag is the gate that keeps reviewer noise down, because architect-seed emits many non-load-bearing seeds.
+• A promoted core_hook=true hook that has been stale for over 10 chapters → escalate from warning to critical. The book has only 3-7 core hooks; letting one drift that long is the lead symptom of narrative rot (cf. new.txt L1569).
+• A promoted hook whose status cell contains "blocked on X (blocked Y chapters)" with Y >= 6 → warning. The literal "blocked Y chapters" token comes straight from the ledger — read it, don't guess. Call out the upstream hook id so the planner can route the resolution.
+• At volume end (final chapter of any volume per volume_map) a promoted core_hook that is still open or stale without explicit "carried over to volume N+1" planning → critical.
+• Any non-promoted stale hook → info-level log; do not fail the chapter on it, but note it so the planner can schedule cleanup.
+
+Quote the exact hook_id in description and include the stale / blocked marker text verbatim. Structure check only — do not judge hook prose quality.`
+        : `Phase 7 hook-debt 升级规则（含 hotfix 2/3）。阅读 pending_hooks.md 伏笔池时不要只看"有没有悬而未决的伏笔"，要读状态列中的 stale / blocked 标记、core_hook 列、depends_on 列、以及升级列：
+
+• critical 级别仅适用于升级=是（promoted=true）的伏笔。非升级的 stale/blocked 伏笔一律保持 info——升级标志是降噪的开关，因为架构师阶段会产出大量非承重的伏笔种子。
+• 升级=是且 core_hook=是 的伏笔过期超过 10 章未回收 → warning 升级为 critical。全书只有 3-7 条核心伏笔，任何一条漂移这么久都是烂尾前兆（对应 new.txt L1569"严禁烂尾逻辑"）。
+• 升级=是的受阻伏笔，状态列中"受阻于 X (已阻 Y 章)"且 Y ≥ 6 → warning。"已阻 Y 章"这个字面 token 直接读自账本，不要猜。描述中要写出具体的上游 hook_id，让 planner 能安排落地路径。
+• 卷尾（volume_map 中任一卷的末章）仍有升级=是的主线伏笔处于 open 或 stale 且没有显式"延至下一卷"规划 → critical。
+• 升级=否的 stale 伏笔 → info 级记录，不判本章失败，但保留以便 planner 安排清理。
+
+description 中要明确引用 hook_id，并把状态列中 stale / blocked 的原文标记字面抄进去。本维度只审结构，不评价伏笔文笔。`;
     case 19:
       return language === "en"
         ? "Check whether POV shifts are signaled clearly and stay consistent with the configured viewpoint."
@@ -198,12 +252,12 @@ function buildDimensionNote(
         : "检查番外是否越权回收正传伏笔（warning级别）";
     case 32:
       return language === "en"
-        ? "Check whether the ending renews curiosity, whether promised payoffs are landing on the cadence their hooks imply, whether pressure gets any release, and whether reader expectation gaps are accumulating faster than they are being satisfied."
-        : "检查：章尾是否重新点燃好奇心，已经承诺的回收是否按伏笔自身节奏落地，压力是否得到释放，读者期待缺口是在持续累积还是在被满足。";
+        ? "Check whether the ending renews curiosity, whether promised payoffs are landing on the cadence their hooks imply, whether pressure gets any release, and whether reader expectation gaps are accumulating faster than they are being satisfied. If a climax just occurred, check whether the aftermath chapters show concrete change before starting a new cycle."
+        : "检查：章尾是否重新点燃好奇心，已经承诺的回收是否按伏笔自身节奏落地，压力是否得到释放，读者期待缺口是在持续累积还是在被满足。如果刚经历高潮，检查后效章节是否在开启新周期前展示了具体改变。";
     case 33:
       return language === "en"
-        ? "Cross-check volume_outline: does this chapter match the planned beat for the current chapter range? Did it skip planned nodes or consume later nodes too early? Does actual pacing match the planned chapter span? If a beat planned for N chapters is consumed in 1-2 chapters -> critical."
-        : "对照 volume_outline：本章内容是否对应卷纲中当前章节范围的剧情节点？是否跳过了节点或提前消耗了后续节点？剧情推进速度是否与卷纲规划的章节跨度匹配？如果卷纲规划某段剧情跨N章但实际1-2章就讲完→critical";
+        ? "Cross-check the chapter_memo provided with the chapter. Does the final prose deliver the memo's goal and leave a visible trace for every one of the 7 sections it contains (tasks, pay-offs / held-back cards, daily/transition function map, three-question check, end-of-chapter concrete changes, hard-don'ts)? Missing or contradicted sections -> critical. Note: a sparse memo (breather chapter, goal + skeleton body only) is legitimate — only flag drift against sections that the memo actually populates. Never flag the memo itself for being sparse."
+        : "对照随章提供的 chapter_memo。成稿是否兑现了 memo 中的 goal，并在 7 段正文（当前任务 / 该兑现·暂不掀 / 日常过渡功能 / 关键抉择三连问 / 章尾必须发生的改变 / 不要做 等）中留下可见落地痕迹？任何段落缺失或被写反 → critical。提醒：稀疏 memo 合法（喘息章 memo 可以只有 goal + 骨架 body），只检查 memo 实际写出的段落，不能因为 memo 稀疏就判 incomplete。";
     case 34:
     case 35:
     case 36:
@@ -269,7 +323,7 @@ function buildDimensionList(
 
   // Always-active dimensions
   activeIds.add(32); // 读者期待管理 — universal
-  activeIds.add(33); // 大纲偏离检测 — universal
+  activeIds.add(33); // 章节备忘偏离 — universal (replaces legacy volume-outline drift)
 
   // Conditional overrides
   if (gp.eraResearch || bookRules?.eraConstraints?.enabled) {
@@ -323,6 +377,7 @@ export class ContinuityAuditor extends BaseAgent {
     options?: {
       temperature?: number;
       chapterIntent?: string;
+      chapterMemo?: ChapterMemo;
       contextPackage?: ContextPackage;
       ruleStack?: RuleStack;
       truthFileOverrides?: {
@@ -334,17 +389,19 @@ export class ContinuityAuditor extends BaseAgent {
   ): Promise<AuditResult> {
     const [diskCurrentState, diskLedger, diskHooks, styleGuideRaw, subplotBoard, emotionalArcs, characterMatrix, chapterSummaries, parentCanon, fanficCanon, volumeOutline] =
       await Promise.all([
-        this.readFileSafe(join(bookDir, "story/current_state.md")),
+        // Phase 5 consolidation: derive initial state from roles + seed hooks
+        // when current_state.md is still the architect seed placeholder.
+        readCurrentStateWithFallback(bookDir, "(文件不存在)"),
         this.readFileSafe(join(bookDir, "story/particle_ledger.md")),
         this.readFileSafe(join(bookDir, "story/pending_hooks.md")),
         this.readFileSafe(join(bookDir, "story/style_guide.md")),
         this.readFileSafe(join(bookDir, "story/subplot_board.md")),
         this.readFileSafe(join(bookDir, "story/emotional_arcs.md")),
-        this.readFileSafe(join(bookDir, "story/character_matrix.md")),
+        readCharacterContext(bookDir, "(文件不存在)"),
         this.readFileSafe(join(bookDir, "story/chapter_summaries.md")),
         this.readFileSafe(join(bookDir, "story/parent_canon.md")),
         this.readFileSafe(join(bookDir, "story/fanfic_canon.md")),
-        this.readFileSafe(join(bookDir, "story/volume_outline.md")),
+        readVolumeMap(bookDir, "(文件不存在)"),
       ]);
     const currentState = options?.truthFileOverrides?.currentState ?? diskCurrentState;
     const ledger = options?.truthFileOverrides?.ledger ?? diskLedger;
@@ -365,10 +422,15 @@ export class ContinuityAuditor extends BaseAgent {
     const parsedRules = await readBookRules(bookDir);
     const bookRules = parsedRules?.rules ?? null;
 
-    // Fallback: use book_rules body when style_guide.md doesn't exist
+    // Fallback: use book_rules body when style_guide.md doesn't exist.
+    // Phase 5 hotfix 2: parsedRules.body is only populated for legacy
+    // book_rules.md sources — story_frame.md frontmatter yields an empty
+    // body, and an empty string is NOT a usable style guide. Treat
+    // missing/empty body as "no fallback available".
+    const legacyRulesBody = parsedRules?.body?.trim();
     const styleGuide = styleGuideRaw !== "(文件不存在)"
       ? styleGuideRaw
-      : (parsedRules?.body ?? "(无文风指南)");
+      : (legacyRulesBody || "(无文风指南)");
 
     const resolvedLanguage = bookLanguage ?? gp.language;
     const isEnglish = resolvedLanguage === "en";
@@ -392,7 +454,17 @@ export class ContinuityAuditor extends BaseAgent {
       : "";
 
     const systemPrompt = isEnglish
-      ? `You are a strict ${genreLabel} web fiction editor. Audit the chapter for continuity, consistency, and quality. ALL OUTPUT MUST BE IN ENGLISH.${protagonistBlock}${searchNote}
+      ? `You are a strict ${genreLabel} web-fiction structural editor. Audit the chapter for completion and structure, not for prose craft. ALL OUTPUT MUST BE IN ENGLISH.${protagonistBlock}${searchNote}
+
+## Reviewer Scope (hard constraints)
+
+You audit completion and structure only. Your job is to decide whether the chapter delivers the plan, keeps characters and timelines intact, and moves the book forward. Wording, sentence rhythm, paragraph shape, punctuation, imagery, and other prose-surface choices are NOT yours — those belong to the Polisher pass that runs after you. If you notice prose-surface issues, you may flag them with severity "info" so the Polisher can see them, but they do not count toward passed / overall_score and they must never be critical.
+
+You audit twelve structural reader-pain patterns: dragging / flat openings, blurry worldbuilding disconnected from reality, contradictory character setup, tangled POV, mainline drift or stagnation, weak conflict with missing payoff, pacing loss of control and abrupt transitions, character inconsistency across the arc, thin/one-note characters without contrast, stiff emotion expression and abrupt relationship jumps, imbalanced cheats/power gifts, and settings that never land in concrete action. Alongside these, keep the engineering dimensions listed below (OOC, timeline coherence, information boundary, hook debt, cross-chapter repetition, lexical fatigue, length band, title fatigue, paragraph shape).
+
+Sparse chapter_memo is legitimate. Breather / aftermath / transition chapters may ship a memo that only contains goal + a skeleton body — do NOT flag such memos as incomplete, and do NOT penalise the chapter for lacking content against sections the memo itself does not populate. Judge drift only against what the memo actually says.
+
+If the chapter memo, rule stack, or supplied context specifies content proportions between lines (politics/romance, career/relationship, case/character, etc.), audit whether those lines appear as actual scenes, dialogue, action, or relationship movement. A line that is only summarized in one sentence counts as missing. Mark it critical only when the memo explicitly required it for this chapter.
 
 Audit dimensions:
 ${dimList}
@@ -400,6 +472,7 @@ ${dimList}
 Output format MUST be JSON:
 {
   "passed": true/false,
+  "overall_score": 0-100,
   "issues": [
     {
       "severity": "critical|warning|info",
@@ -411,8 +484,26 @@ Output format MUST be JSON:
   "summary": "one-sentence audit conclusion"
 }
 
-passed is false ONLY when critical-severity issues exist.`
-      : `你是一位严格的${gp.name}网络小说审稿编辑。你的任务是对章节进行连续性、一致性和质量审查。${protagonistBlock}${searchNote}
+passed is false ONLY when critical-severity issues exist.
+
+overall_score calibration:
+- 95-100: Publishable as-is, no noticeable issues
+- 85-94: Minor blemishes but smooth reading, the reader won't break immersion
+- 75-84: Noticeable problems but the story backbone holds, needs revision but not urgent
+- 65-74: Multiple issues hurt the reading experience, pacing or continuity has gaps
+- < 65: Structural breakdown, needs major rewrite
+Score holistically — do not let a single minor issue tank the score.`
+      : `你是一位严格的${gp.name}网络小说结构审稿编辑。你只审完成度 + 结构，不审文笔。${protagonistBlock}${searchNote}
+
+## 审稿边界（硬约束）
+
+你不审文笔、不审排版、不审句式——这些归 Polisher。你发现的文笔问题只能以 severity="info" 标注供 Polisher 参考，不计入 reviewer 的 passed/overall_score，也绝不可标为 critical。
+
+你审 12 条结构类雷点：开篇拖沓/平淡、世界观模糊脱现实、人设矛盾、视角杂乱、主线偏离/停滞、冲突乏力爽点缺失、节奏失控过渡生硬、人设前后矛盾、人物单薄无反差、情感表达生硬/关系突兀、金手指失衡、设定无落地。同时保留工程维度（OOC、timeline 一致、信息越界、hook-debt、跨章重复、词汇疲劳、章节字数、标题疲劳、段落形状）。
+
+稀疏 memo 是合法状态。喘息章 / 后效章 / 过渡章的 memo 可以只有 goal + 骨架 body——此类 memo 不判 incomplete，也不能因为 memo 没写的段落就扣成稿的分。只按 memo 实际写出来的内容判偏离。
+
+如果章节备忘、规则栈或输入上下文明确指定多条剧情线的比例（权谋/感情、事业/恋爱、案件/人物等），要审它们是否真正落成了场景、对话、行动或关系变化。只用一句总结带过的线，视为缺失。只有当 memo 明确要求本章必须推进该线时，才标 critical。
 
 审查维度：
 ${dimList}
@@ -420,6 +511,7 @@ ${dimList}
 输出格式必须为 JSON：
 {
   "passed": true/false,
+  "overall_score": 0-100,
   "issues": [
     {
       "severity": "critical|warning|info",
@@ -431,7 +523,15 @@ ${dimList}
   "summary": "一句话总结审查结论"
 }
 
-只有当存在 critical 级别问题时，passed 才为 false。`;
+只有当存在 critical 级别问题时，passed 才为 false。
+
+overall_score 评分校准：
+- 95-100：可直接发布，无明显问题
+- 85-94：有小瑕疵但整体流畅可读，读者不会出戏
+- 75-84：有明显问题但故事主干完整，需要修但不紧急
+- 65-74：多处影响阅读体验的问题，节奏或连续性有断裂
+- < 65：结构性问题，需要大幅重写
+综合评分，不要因为单一小问题大幅拉低分数。`;
 
     const ledgerBlock = gp.numericalSystem
       ? isEnglish
@@ -492,10 +592,10 @@ ${dimList}
         : `\n## 同人正典参照（同人审查专用）\n${fanficCanon}\n`
       : "";
 
-    const outlineBlock = volumeOutline !== "(文件不存在)"
+    const memoBlock = options?.chapterMemo
       ? isEnglish
-        ? `\n## Volume Outline (for outline drift checks)\n${volumeOutline}\n`
-        : `\n## 卷纲（用于大纲偏离检测）\n${volumeOutline}\n`
+        ? `\n## Chapter Memo (for memo drift checks)\nGoal: ${options.chapterMemo.goal}\n\n${options.chapterMemo.body}\n`
+        : `\n## 章节备忘（用于 memo 偏离检测）\ngoal：${options.chapterMemo.goal}\n\n${options.chapterMemo.body}\n`
       : "";
     const reducedControlBlock = options?.chapterIntent && options.contextPackage && options.ruleStack
       ? this.buildReducedControlBlock(options.chapterIntent, options.contextPackage, options.ruleStack, resolvedLanguage)
@@ -518,7 +618,7 @@ ${dimList}
 ## Current State Card
 ${currentState}
 ${ledgerBlock}
-${hooksBlock}${volumeSummariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}${summariesBlock}${canonBlock}${fanficCanonBlock}${reducedControlBlock || outlineBlock}${prevChapterBlock}${styleGuideBlock}
+${hooksBlock}${volumeSummariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}${summariesBlock}${canonBlock}${fanficCanonBlock}${reducedControlBlock}${memoBlock}${prevChapterBlock}${styleGuideBlock}
 
 ## Chapter Content Under Review
 ${chapterContent}`
@@ -527,7 +627,7 @@ ${chapterContent}`
 ## 当前状态卡
 ${currentState}
 ${ledgerBlock}
-${hooksBlock}${volumeSummariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}${summariesBlock}${canonBlock}${fanficCanonBlock}${reducedControlBlock || outlineBlock}${prevChapterBlock}${styleGuideBlock}
+${hooksBlock}${volumeSummariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}${summariesBlock}${canonBlock}${fanficCanonBlock}${reducedControlBlock}${memoBlock}${prevChapterBlock}${styleGuideBlock}
 
 ## 待审章节内容
 ${chapterContent}`;
@@ -536,7 +636,7 @@ ${chapterContent}`;
       { role: "system" as const, content: systemPrompt },
       { role: "user" as const, content: userPrompt },
     ];
-    const chatOptions = { temperature: options?.temperature ?? 0.3, maxTokens: 8192 };
+    const chatOptions = { temperature: options?.temperature ?? 0.3 };
 
     // Use web search for fact verification when eraResearch is enabled
     const response = gp.eraResearch
@@ -678,6 +778,10 @@ ${overrides}\n`;
     try {
       const parsed = JSON.parse(json);
       if (typeof parsed.passed !== "boolean" && parsed.passed !== undefined) return null;
+      const rawScore = parsed.overall_score ?? parsed.overallScore;
+      const overallScore = typeof rawScore === "number" && Number.isFinite(rawScore)
+        ? Math.round(Math.max(0, Math.min(100, rawScore)))
+        : undefined;
       return {
         passed: Boolean(parsed.passed ?? false),
         issues: Array.isArray(parsed.issues)
@@ -689,6 +793,7 @@ ${overrides}\n`;
             }))
           : [],
         summary: String(parsed.summary ?? ""),
+        overallScore,
       };
     } catch {
       return null;

@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { readCurrentStateWithFallback } from "./outline-paths.js";
 import {
   ChapterSummariesStateSchema,
   CurrentStateStateSchema,
@@ -8,11 +9,10 @@ import {
 import { MemoryDB, type Fact, type StoredHook, type StoredSummary } from "../state/memory-db.js";
 import { bootstrapStructuredStateFromMarkdown } from "../state/state-bootstrap.js";
 import {
-  buildPlannerHookAgenda,
   filterActiveHooks,
   isFuturePlannedHook,
   isHookWithinChapterWindow,
-} from "./hook-agenda.js";
+} from "./hook-lifecycle.js";
 import {
   parseChapterSummariesMarkdown,
   parseCurrentStateFacts,
@@ -21,10 +21,9 @@ import {
   renderSummarySnapshot,
 } from "./story-markdown.js";
 export {
-  buildPlannerHookAgenda,
   isFuturePlannedHook,
   isHookWithinChapterWindow,
-} from "./hook-agenda.js";
+} from "./hook-lifecycle.js";
 export {
   parseChapterSummariesMarkdown,
   parseCurrentStateFacts,
@@ -37,6 +36,12 @@ export interface MemorySelection {
   readonly summaries: ReadonlyArray<StoredSummary>;
   readonly hooks: ReadonlyArray<StoredHook>;
   readonly activeHooks: ReadonlyArray<StoredHook>;
+  /**
+   * Hooks with recycling pressure — stale hooks that the planner must
+   * advance/resolve/defer (and if deferred, justify). Sorted by staleness DESC
+   * (most overdue first). See computeRecyclableHooks for the selection rule.
+   */
+  readonly recyclableHooks: ReadonlyArray<StoredHook>;
   readonly facts: ReadonlyArray<Fact>;
   readonly volumeSummaries: ReadonlyArray<VolumeSummarySelection>;
   readonly dbPath?: string;
@@ -71,7 +76,7 @@ export async function retrieveMemorySelection(params: {
     structuredHooks,
     structuredSummaries,
   ] = await Promise.all([
-    readFile(join(storyDir, "current_state.md"), "utf-8").catch(() => ""),
+    readCurrentStateWithFallback(params.bookDir),
     readFile(join(storyDir, "volume_summaries.md"), "utf-8").catch(() => ""),
     readStructuredState(join(stateDir, "current_state.json"), CurrentStateStateSchema),
     readStructuredState(join(stateDir, "hooks.json"), HooksStateSchema),
@@ -129,6 +134,7 @@ export async function retrieveMemorySelection(params: {
         ),
         hooks: selectRelevantHooks(activeHooks, narrativeQueryTerms, params.chapterNumber),
         activeHooks,
+        recyclableHooks: computeRecyclableHooks(activeHooks, params.chapterNumber),
         facts: selectRelevantFacts(memoryDb.getCurrentFacts(), factQueryTerms),
         volumeSummaries,
         dbPath: join(storyDir, "memory.db"),
@@ -150,9 +156,55 @@ export async function retrieveMemorySelection(params: {
     summaries: selectRelevantSummaries(summaries, params.chapterNumber, narrativeQueryTerms),
     hooks: selectRelevantHooks(activeHooks, narrativeQueryTerms, params.chapterNumber),
     activeHooks,
+    recyclableHooks: computeRecyclableHooks(activeHooks, params.chapterNumber),
     facts: selectRelevantFacts(facts, factQueryTerms),
     volumeSummaries,
   };
+}
+
+/**
+ * Phase 9-2: Hooks that the planner MUST address this chapter.
+ *
+ * An active hook is "recyclable" (i.e., stale enough to force an
+ * advance/resolve/defer decision) when any of the following holds:
+ *
+ *   - pressured / near_payoff / progressing: silent for ≥ 5 chapters
+ *   - planted / open: silent for ≥ 10 chapters
+ *   - coreHook === true:                      silent for ≥ 8 chapters
+ *
+ * "Silent" = (chapterNumber − max(startChapter, lastAdvancedChapter)).
+ * Future-planted hooks are excluded (they aren't overdue yet).
+ * Sorted by silence DESC — most overdue first — so the planner sees the
+ * worst debt at the top of its prompt slice.
+ */
+export function computeRecyclableHooks(
+  hooks: ReadonlyArray<StoredHook>,
+  chapterNumber: number,
+): StoredHook[] {
+  return hooks
+    .filter((hook) => !isRecycleTerminalStatus(hook.status))
+    .filter((hook) => !isFuturePlannedHook(hook, chapterNumber))
+    .map((hook) => ({ hook, silence: hookSilence(hook, chapterNumber) }))
+    .filter(({ hook, silence }) => silence >= recycleThreshold(hook))
+    .sort((a, b) => b.silence - a.silence || a.hook.startChapter - b.hook.startChapter)
+    .map(({ hook }) => hook);
+}
+
+function isRecycleTerminalStatus(status: string): boolean {
+  return /^(resolved|closed|done|已回收|已解决|deferred|paused|hold|延后|延期|搁置|暂缓)$/i.test(status.trim());
+}
+
+function hookSilence(hook: StoredHook, chapterNumber: number): number {
+  const lastTouch = Math.max(hook.startChapter, hook.lastAdvancedChapter);
+  if (lastTouch <= 0) return chapterNumber;
+  return Math.max(0, chapterNumber - lastTouch);
+}
+
+function recycleThreshold(hook: StoredHook): number {
+  const status = hook.status.trim().toLowerCase();
+  if (/pressured|near[_\s-]?payoff|progressing|重大推进|持续推进/.test(status)) return 5;
+  if (hook.coreHook === true) return 8;
+  return 10;
 }
 
 export function extractQueryTerms(goal: string, outlineNode: string | undefined, mustKeep: ReadonlyArray<string>): string[] {

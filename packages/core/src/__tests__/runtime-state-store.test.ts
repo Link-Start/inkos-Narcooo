@@ -237,6 +237,69 @@ describe("runtime-state-store memory helpers", () => {
     expect(snapshot.chapterSummaries.rows[0]?.title).toBe("重复河埠对账");
   });
 
+  it("repairs persisted hooks with empty type instead of failing the library load", async () => {
+    root = await mkdtemp(join(tmpdir(), "inkos-runtime-state-hook-repair-"));
+    const bookDir = join(root, "book");
+    const storyDir = join(bookDir, "story");
+    const stateDir = join(storyDir, "state");
+    const chaptersDir = join(bookDir, "chapters");
+    await mkdir(stateDir, { recursive: true });
+    await mkdir(chaptersDir, { recursive: true });
+
+    await Promise.all([
+      writeFile(
+        join(chaptersDir, "index.json"),
+        JSON.stringify(Array.from({ length: 5 }, (_, i) => ({ number: i + 1, title: `Ch${i + 1}`, status: "approved" }))),
+        "utf-8",
+      ),
+      writeFile(
+        join(storyDir, "pending_hooks.md"),
+        [
+          "| hook_id | start_chapter | type | status | last_advanced | expected_payoff | payoff_timing | notes |",
+          "| --- | --- | --- | --- | --- | --- | --- | --- |",
+          "| h001--broken | 3 |  | open | 5 | 后续揭开账本来源。 | near-term | 模型生成了空 type。 |",
+          "",
+        ].join("\n"),
+        "utf-8",
+      ),
+      writeFile(join(stateDir, "manifest.json"), JSON.stringify({
+        schemaVersion: 2,
+        language: "zh",
+        lastAppliedChapter: 5,
+        projectionVersion: 1,
+        migrationWarnings: [],
+      }, null, 2), "utf-8"),
+      writeFile(join(stateDir, "current_state.json"), JSON.stringify({
+        chapter: 5,
+        facts: [],
+      }, null, 2), "utf-8"),
+      writeFile(join(stateDir, "hooks.json"), JSON.stringify({
+        hooks: [
+          {
+            hookId: "h001--broken",
+            startChapter: 3,
+            type: "",
+            status: "open",
+            lastAdvancedChapter: 5,
+            expectedPayoff: "后续揭开账本来源。",
+            notes: "模型生成了空 type，旧版本会导致 books 接口整体报错。",
+          },
+        ],
+      }, null, 2), "utf-8"),
+      writeFile(join(stateDir, "chapter_summaries.json"), JSON.stringify({
+        rows: [],
+      }, null, 2), "utf-8"),
+    ]);
+
+    const snapshot = await loadRuntimeStateSnapshot(bookDir);
+
+    expect(snapshot.hooks.hooks[0]).toEqual(expect.objectContaining({
+      hookId: "h001--broken",
+      type: "unspecified",
+    }));
+    expect(snapshot.manifest.migrationWarnings.join("\n")).toContain("empty hook type");
+  });
+
   it("arbitrates new hook candidates before applying structured state updates", async () => {
     root = await mkdtemp(join(tmpdir(), "inkos-runtime-state-arbiter-"));
     const bookDir = join(root, "book");

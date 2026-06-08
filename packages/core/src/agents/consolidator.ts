@@ -1,11 +1,23 @@
 import { BaseAgent } from "./base.js";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { readVolumeMap } from "../utils/outline-paths.js";
+import {
+  parsePendingHooksMarkdown,
+  renderHookSnapshot,
+} from "../utils/story-markdown.js";
+import type { StoredHook } from "../state/memory-db.js";
 
 export interface ConsolidationResult {
   readonly volumeSummaries: string;
   readonly archivedVolumes: number;
   readonly retainedChapters: number;
+  /**
+   * Phase 7 hotfix 2: number of ledger hooks whose `promoted` flag flipped
+   * from false to true during this consolidation run (advanced_count rule).
+   * 0 when pending_hooks.md is absent or no hook crossed the threshold.
+   */
+  readonly promotedHookCount: number;
 }
 
 /**
@@ -19,35 +31,41 @@ export class ConsolidatorAgent extends BaseAgent {
 
   /**
    * Consolidate chapter summaries by volume.
-   * - Reads volume_outline to determine volume boundaries
+   * - Reads outline/volume_map.md (fallback: legacy volume_outline.md) to
+   *   determine volume boundaries
    * - For each completed volume, LLM compresses chapter summaries into a narrative paragraph
    * - Archives detailed summaries, keeps only recent volume's per-chapter rows
    */
   async consolidate(bookDir: string): Promise<ConsolidationResult> {
     const storyDir = join(bookDir, "story");
     const summariesPath = join(storyDir, "chapter_summaries.md");
-    const outlinePath = join(storyDir, "volume_outline.md");
     const volumeSummariesPath = join(storyDir, "volume_summaries.md");
 
     const [summariesRaw, outlineRaw] = await Promise.all([
       readFile(summariesPath, "utf-8").catch(() => ""),
-      readFile(outlinePath, "utf-8").catch(() => ""),
+      readVolumeMap(bookDir, ""),
     ]);
 
+    // Phase 7 hotfix 2: pre-archive re-promotion pass. Runs independently of
+    // summary consolidation so a new book (no completed volumes yet) still
+    // flips the `promoted` flag whenever a seed's advanced_count crosses the
+    // threshold.
+    const promotedHookCount = await this.rerunAdvancedCountPromotion(storyDir);
+
     if (!summariesRaw || !outlineRaw) {
-      return { volumeSummaries: "", archivedVolumes: 0, retainedChapters: 0 };
+      return { volumeSummaries: "", archivedVolumes: 0, retainedChapters: 0, promotedHookCount };
     }
 
     // Parse volume boundaries from outline
     const volumeBoundaries = this.parseVolumeBoundaries(outlineRaw);
     if (volumeBoundaries.length === 0) {
-      return { volumeSummaries: "", archivedVolumes: 0, retainedChapters: 0 };
+      return { volumeSummaries: "", archivedVolumes: 0, retainedChapters: 0, promotedHookCount };
     }
 
     // Parse chapter summaries into rows
     const { header, rows } = this.parseSummaryTable(summariesRaw);
     if (rows.length === 0) {
-      return { volumeSummaries: "", archivedVolumes: 0, retainedChapters: 0 };
+      return { volumeSummaries: "", archivedVolumes: 0, retainedChapters: 0, promotedHookCount };
     }
 
     const maxChapter = Math.max(...rows.map((r) => r.chapter));
@@ -77,7 +95,12 @@ export class ConsolidatorAgent extends BaseAgent {
     }
 
     if (completedVolumes.length === 0) {
-      return { volumeSummaries: "", archivedVolumes: 0, retainedChapters: currentVolumeRows.length };
+      return {
+        volumeSummaries: "",
+        archivedVolumes: 0,
+        retainedChapters: currentVolumeRows.length,
+        promotedHookCount,
+      };
     }
 
     // LLM consolidation for each completed volume
@@ -96,7 +119,7 @@ export class ConsolidatorAgent extends BaseAgent {
           role: "user",
           content: `Volume: ${vol.name} (Chapters ${vol.startCh}-${vol.endCh})\n\nChapter summaries:\n${header}\n${volSummaryRows}`,
         },
-      ], { temperature: 0.3, maxTokens: 1024 });
+      ], { temperature: 0.3 });
 
       newSummaries.push(`\n## ${vol.name} (Ch.${vol.startCh}-${vol.endCh})\n\n${response.content.trim()}`);
     }
@@ -122,7 +145,35 @@ export class ConsolidatorAgent extends BaseAgent {
       volumeSummaries: newSummaries.join("\n"),
       archivedVolumes: completedVolumes.length,
       retainedChapters: currentVolumeRows.length,
+      promotedHookCount,
     };
+  }
+
+  /**
+   * Phase 7 hotfix 2 — re-run promotion for seeds whose advancedCount has
+   * crossed the 2-chapter threshold since architect seed time. Delegates to
+   * the shared `rerunPromotionPass` in utils/hook-promotion.ts.
+   *
+   * Returns the number of hooks that flipped from promoted=false (or
+   * undefined) to promoted=true this run.
+   */
+  private async rerunAdvancedCountPromotion(storyDir: string): Promise<number> {
+    const ledgerPath = join(storyDir, "pending_hooks.md");
+    const raw = await readFile(ledgerPath, "utf-8").catch(() => "");
+    if (!raw.trim()) return 0;
+
+    const hooks = parsePendingHooksMarkdown(raw);
+    if (hooks.length === 0) return 0;
+
+    const language: "zh" | "en" = /[\u4e00-\u9fff]/.test(raw) ? "zh" : "en";
+    const summariesRaw = await readFile(join(storyDir, "chapter_summaries.md"), "utf-8").catch(() => "");
+
+    const { rerunPromotionPass } = await import("../utils/hook-promotion.js");
+    const result = rerunPromotionPass(hooks, summariesRaw);
+    if (!result.updated) return 0;
+
+    await writeFile(ledgerPath, renderHookSnapshot([...result.hooks], language), "utf-8");
+    return result.flippedCount;
   }
 
   private parseVolumeBoundaries(outline: string): Array<{ name: string; startCh: number; endCh: number }> {

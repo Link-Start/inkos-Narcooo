@@ -8,9 +8,9 @@ describe("buildApiUrl", () => {
   });
 
   it("prefixes api paths once", () => {
-    expect(buildApiUrl("/books")).toBe("/api/books");
-    expect(buildApiUrl("books")).toBe("/api/books");
-    expect(buildApiUrl("/api/books")).toBe("/api/books");
+    expect(buildApiUrl("/books")).toBe("/api/v1/books");
+    expect(buildApiUrl("books")).toBe("/api/v1/books");
+    expect(buildApiUrl("/api/v1/books")).toBe("/api/v1/books");
   });
 });
 
@@ -48,31 +48,46 @@ describe("fetchJson", () => {
 
     await expect(fetchJson("/books/../bad", {}, { fetchImpl })).rejects.toThrow("Invalid book ID: ../bad");
   });
+
+  it("localizes known runtime errors before throwing", async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({
+        error: "Latest chapter 1 is state-degraded. Repair state or rewrite that chapter before continuing.",
+      }), {
+        status: 409,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    await expect(fetchJson("/books/demo/write-next", { method: "POST" }, { fetchImpl })).rejects.toThrow(
+      "最新第 1 章处于状态降级（state-degraded）。继续写下一章前，请先修复状态，或重写这一章。",
+    );
+  });
 });
 
 describe("deriveInvalidationPaths", () => {
   it("refreshes book collections after creating a book", () => {
-    expect(deriveInvalidationPaths("/books/create")).toEqual(["/api/books"]);
+    expect(deriveInvalidationPaths("/books/create")).toEqual(["/api/v1/books"]);
   });
 
   it("refreshes both collections and the current book after book mutations", () => {
     expect(deriveInvalidationPaths("/books/demo/write-next")).toEqual([
-      "/api/books",
-      "/api/books/demo",
+      "/api/v1/books",
+      "/api/v1/books/demo",
     ]);
     expect(deriveInvalidationPaths("/books/demo/chapters/3/approve")).toEqual([
-      "/api/books",
-      "/api/books/demo",
+      "/api/v1/books",
+      "/api/v1/books/demo",
     ]);
   });
 
   it("refreshes daemon state after daemon mutations", () => {
-    expect(deriveInvalidationPaths("/daemon/start")).toEqual(["/api/daemon"]);
-    expect(deriveInvalidationPaths("/daemon/stop")).toEqual(["/api/daemon"]);
+    expect(deriveInvalidationPaths("/daemon/start")).toEqual(["/api/v1/daemon"]);
+    expect(deriveInvalidationPaths("/daemon/stop")).toEqual(["/api/v1/daemon"]);
   });
 
   it("refreshes project data after project mutations", () => {
-    expect(deriveInvalidationPaths("/project")).toEqual(["/api/project"]);
-    expect(deriveInvalidationPaths("/project/language")).toEqual(["/api/project", "/api/project/language"]);
+    expect(deriveInvalidationPaths("/project")).toEqual(["/api/v1/project"]);
+    expect(deriveInvalidationPaths("/project/language")).toEqual(["/api/v1/project", "/api/v1/project/language"]);
   });
 });

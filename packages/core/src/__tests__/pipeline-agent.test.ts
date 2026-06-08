@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AGENT_TOOLS, executeAgentTool } from "../pipeline/agent.js";
 import { PipelineRunner, StateManager, type PipelineConfig } from "../index.js";
+import { PlannerAgent } from "../agents/planner.js";
 
 describe("agent pipeline tools", () => {
   let root: string;
@@ -25,7 +26,7 @@ describe("agent pipeline tools", () => {
         defaults: {
           temperature: 0.7,
           maxTokens: 4096,
-          thinkingBudget: 0, maxTokensCap: null,
+          thinkingBudget: 0,
           extra: {},
         },
       },
@@ -53,6 +54,51 @@ describe("agent pipeline tools", () => {
     await mkdir(join(state.bookDir(bookId), "chapters"), { recursive: true });
     await writeFile(join(state.bookDir(bookId), "chapters", "index.json"), "[]", "utf-8");
 
+    vi.spyOn(PlannerAgent.prototype, "planChapter").mockImplementation(async (input) => {
+      const chapterNumber = input.chapterNumber;
+      // Try to read the local override from current_focus.md, mirroring the real planner logic
+      let goal = input.externalContext ?? "test goal";
+      try {
+        const { readFile: readFs } = await import("node:fs/promises");
+        const focusContent = await readFs(join(input.bookDir, "story", "current_focus.md"), "utf-8");
+        const overrideMatch = focusContent.match(/## Local Override\s*\n+([^\n#]+)/);
+        if (overrideMatch?.[1]?.trim()) {
+          goal = overrideMatch[1].trim();
+        }
+      } catch { /* ignore missing file */ }
+      const memo = {
+        chapter: chapterNumber,
+        goal,
+        isGoldenOpening: false,
+        body: "",
+        threadRefs: [] as string[],
+      };
+      const intentMarkdown = [
+        "# Chapter Intent",
+        "",
+        "## Goal",
+        goal,
+      ].join("\n");
+      const { mkdir: mkdirFs, writeFile: writeFileFs } = await import("node:fs/promises");
+      const runtimeDir = join(input.bookDir, "story", "runtime");
+      await mkdirFs(runtimeDir, { recursive: true });
+      const runtimePath = join(runtimeDir, `chapter-${String(chapterNumber).padStart(4, "0")}.intent.md`);
+      await writeFileFs(runtimePath, intentMarkdown, "utf-8");
+      return {
+        intent: {
+          chapter: chapterNumber,
+          goal,
+          mustKeep: [],
+          mustAvoid: [],
+          styleEmphasis: [],
+        },
+        memo,
+        intentMarkdown,
+        plannerInputs: [runtimePath],
+        runtimePath,
+      };
+    });
+
     await Promise.all([
       writeFile(join(storyDir, "author_intent.md"), "# Author Intent\n\nKeep the story centered on the mentor conflict.\n", "utf-8"),
       writeFile(join(storyDir, "current_focus.md"), "# Current Focus\n\nBring focus back to the mentor conflict.\n", "utf-8"),
@@ -65,6 +111,7 @@ describe("agent pipeline tools", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await rm(root, { recursive: true, force: true });
   });
 
@@ -115,6 +162,29 @@ describe("agent pipeline tools", () => {
       .resolves.toContain("colder revenge story");
     await expect(readFile(join(state.bookDir(bookId), "story", "current_focus.md"), "utf-8"))
       .resolves.toContain("mentor fallout");
+  });
+
+  it("normalizes human-facing platform aliases before create_book persists config", async () => {
+    const initBook = vi.spyOn(PipelineRunner.prototype, "initBook").mockResolvedValue(undefined);
+
+    const result = JSON.parse(await executeAgentTool(
+      pipeline,
+      state,
+      config,
+      "create_book",
+      {
+        title: "测试书",
+        genre: "urban",
+        platform: "番茄小说",
+        brief: "一本文娱爽文。",
+      },
+    ));
+
+    expect(result).toMatchObject({ bookId: "测试书", title: "测试书", status: "created" });
+    expect(initBook).toHaveBeenCalledWith(expect.objectContaining({
+      id: "测试书",
+      platform: "tomato",
+    }));
   });
 
   it("keeps update_current_focus usable for explicit local overrides through the tool surface", async () => {
@@ -208,5 +278,77 @@ describe("agent pipeline tools", () => {
     ));
 
     expect(result.error).toContain("章节进度");
+  });
+
+  // Phase hotfix 3: write_truth_file must accept both Chinese and English
+  // role-dir paths so English-layout books are writable, not just readable.
+  it("accepts roles/主要角色/<name>.md (zh locale)", async () => {
+    const result = JSON.parse(await executeAgentTool(
+      pipeline,
+      state,
+      config,
+      "write_truth_file",
+      {
+        bookId,
+        fileName: "roles/主要角色/林辞.md",
+        content: "# 林辞\n核心标签：沉默",
+      },
+    ));
+    expect(result.error).toBeUndefined();
+    const written = await readFile(
+      join(state.bookDir(bookId), "story", "roles/主要角色/林辞.md"),
+      "utf-8",
+    );
+    expect(written).toContain("核心标签");
+  });
+
+  it("accepts roles/major/<name>.md (en locale)", async () => {
+    const result = JSON.parse(await executeAgentTool(
+      pipeline,
+      state,
+      config,
+      "write_truth_file",
+      {
+        bookId,
+        fileName: "roles/major/Mara.md",
+        content: "# Mara\nCore tag: stoic",
+      },
+    ));
+    expect(result.error).toBeUndefined();
+    const written = await readFile(
+      join(state.bookDir(bookId), "story", "roles/major/Mara.md"),
+      "utf-8",
+    );
+    expect(written).toContain("Core tag");
+  });
+
+  it("accepts roles/minor/<name>.md (en locale)", async () => {
+    const result = JSON.parse(await executeAgentTool(
+      pipeline,
+      state,
+      config,
+      "write_truth_file",
+      {
+        bookId,
+        fileName: "roles/minor/Kit.md",
+        content: "# Kit\nMinor ally",
+      },
+    ));
+    expect(result.error).toBeUndefined();
+  });
+
+  it("rejects unknown role tier dirs (path-traversal safety preserved)", async () => {
+    const result = JSON.parse(await executeAgentTool(
+      pipeline,
+      state,
+      config,
+      "write_truth_file",
+      {
+        bookId,
+        fileName: "roles/其他/X.md",
+        content: "# X",
+      },
+    ));
+    expect(result.error).toBeDefined();
   });
 });

@@ -5,6 +5,9 @@ import type { ChapterMeta } from "../models/chapter.js";
 import { bootstrapStructuredStateFromMarkdown, resolveDurableStoryProgress } from "./state-bootstrap.js";
 
 export class StateManager {
+  /** Books actively being written by this process — used for same-process stale lock detection. */
+  private readonly activeWrites = new Set<string>();
+
   constructor(private readonly projectRoot: string) {}
 
   private static defaultAuthorIntent(language: "zh" | "en"): string {
@@ -31,9 +34,15 @@ export class StateManager {
   ): Promise<void> {
     const storyDir = join(bookDir, "story");
     const runtimeDir = join(storyDir, "runtime");
+    const outlineDir = join(storyDir, "outline");
+    const rolesMajorDir = join(storyDir, "roles", "主要角色");
+    const rolesMinorDir = join(storyDir, "roles", "次要角色");
 
     await mkdir(storyDir, { recursive: true });
     await mkdir(runtimeDir, { recursive: true });
+    await mkdir(outlineDir, { recursive: true });
+    await mkdir(rolesMajorDir, { recursive: true });
+    await mkdir(rolesMinorDir, { recursive: true });
 
     await this.writeIfMissing(
       join(storyDir, "author_intent.md"),
@@ -46,6 +55,19 @@ export class StateManager {
       join(storyDir, "current_focus.md"),
       StateManager.defaultCurrentFocus(language),
     );
+
+    // Ensure style_guide includes writing methodology even without reference text
+    const styleGuidePath = join(storyDir, "style_guide.md");
+    try {
+      const existing = await readFile(styleGuidePath, "utf-8");
+      if (!existing.includes("写作方法论") && !existing.includes("Writing Methodology")) {
+        const { buildWritingMethodologySection } = await import("../utils/writing-methodology.js");
+        await writeFile(styleGuidePath, `${existing}\n\n${buildWritingMethodologySection(language)}`, "utf-8");
+      }
+    } catch {
+      const { buildWritingMethodologySection } = await import("../utils/writing-methodology.js");
+      await writeFile(styleGuidePath, buildWritingMethodologySection(language), "utf-8");
+    }
   }
 
   async loadControlDocuments(bookId: string): Promise<{
@@ -93,7 +115,10 @@ export class StateManager {
       if (code === "EEXIST") {
         const lockData = await readFile(lockPath, "utf-8").catch(() => "pid:unknown ts:unknown");
         const lockPid = this.extractLockPid(lockData);
-        if (lockPid !== undefined && !this.isProcessAlive(lockPid)) {
+        const isStale =
+          (lockPid !== undefined && !this.isProcessAlive(lockPid)) ||
+          (lockPid === process.pid && !this.activeWrites.has(bookId));
+        if (isStale) {
           await unlink(lockPath).catch(() => undefined);
           return this.acquireBookLock(bookId);
         }
@@ -104,7 +129,9 @@ export class StateManager {
       }
       throw e;
     }
+    this.activeWrites.add(bookId);
     return async () => {
+      this.activeWrites.delete(bookId);
       try {
         await unlink(lockPath);
       } catch {
@@ -309,22 +336,49 @@ export class StateManager {
   }
 
   async isCompleteBookDirectory(bookDir: string): Promise<boolean> {
-    const requiredPaths = [
+    // Phase 5 cleanup: prefer outline/* paths, fall back to legacy flat files
+    // so older books on disk still resolve as complete.
+    const requiredSingle = [
       join(bookDir, "book.json"),
-      join(bookDir, "story", "story_bible.md"),
-      join(bookDir, "story", "volume_outline.md"),
       join(bookDir, "story", "book_rules.md"),
       join(bookDir, "story", "current_state.md"),
       join(bookDir, "story", "pending_hooks.md"),
       join(bookDir, "chapters", "index.json"),
     ];
 
-    for (const requiredPath of requiredPaths) {
+    const eitherOr: Array<ReadonlyArray<string>> = [
+      // story_frame (new) OR story_bible (legacy)
+      [
+        join(bookDir, "story", "outline", "story_frame.md"),
+        join(bookDir, "story", "story_bible.md"),
+      ],
+      // volume_map (new) OR volume_outline (legacy)
+      [
+        join(bookDir, "story", "outline", "volume_map.md"),
+        join(bookDir, "story", "volume_outline.md"),
+      ],
+    ];
+
+    for (const requiredPath of requiredSingle) {
       try {
         await stat(requiredPath);
       } catch {
         return false;
       }
+    }
+
+    for (const alternatives of eitherOr) {
+      let found = false;
+      for (const candidate of alternatives) {
+        try {
+          await stat(candidate);
+          found = true;
+          break;
+        } catch {
+          // try next alternative
+        }
+      }
+      if (!found) return false;
     }
 
     return true;
@@ -354,11 +408,12 @@ export class StateManager {
 
       await Promise.all(
         optionalFiles.map(async (f) => {
+          const targetPath = join(storyDir, f);
           try {
             const content = await readFile(join(snapshotDir, f), "utf-8");
-            await writeFile(join(storyDir, f), content, "utf-8");
+            await writeFile(targetPath, content, "utf-8");
           } catch {
-            // Optional file missing — skip
+            await rm(targetPath, { force: true });
           }
         }),
       );

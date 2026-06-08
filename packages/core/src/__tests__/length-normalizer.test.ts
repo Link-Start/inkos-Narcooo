@@ -18,7 +18,7 @@ const AGENT_CONTEXT = {
     defaults: {
       temperature: 0.7,
       maxTokens: 4096,
-      thinkingBudget: 0, maxTokensCap: null,
+      thinkingBudget: 0,
       extra: {},
     },
   } as const,
@@ -128,6 +128,86 @@ describe("LengthNormalizerAgent", () => {
     expect(result.applied).toBe(true);
     expect(result.mode).toBe("compress");
     expect(result.warning).toContain("outside");
+  });
+
+  it("does not override provider output budget for large compression outputs", async () => {
+    const agent = createAgent();
+    const chatSpy = vi.spyOn(BaseAgent.prototype as never, "chat").mockResolvedValue({
+      content: "压缩后的完整正文。".repeat(200),
+      usage: ZERO_USAGE,
+    });
+    const lengthSpec = LengthSpecSchema.parse({
+      target: 3500,
+      softMin: 3023,
+      softMax: 3977,
+      hardMin: 2800,
+      hardMax: 4200,
+      countingMode: "zh_chars",
+      normalizeMode: "compress",
+    });
+
+    await agent.normalizeChapter({
+      chapterContent: "原始正文。".repeat(1200),
+      lengthSpec,
+    });
+
+    const options = chatSpy.mock.calls[0]?.[1] as { maxTokens?: number } | undefined;
+    expect(options?.maxTokens).toBeUndefined();
+  });
+
+  it("falls back to the original chapter when normalized output is truncated mid-sentence", async () => {
+    const agent = createAgent();
+    const chatSpy = vi.spyOn(BaseAgent.prototype as never, "chat").mockResolvedValue({
+      content: "李队把传真和登记表叠在一起，收进文件夹，眼神已经不是单",
+      usage: ZERO_USAGE,
+    });
+    const lengthSpec = LengthSpecSchema.parse({
+      target: 3500,
+      softMin: 3023,
+      softMax: 3977,
+      hardMin: 2800,
+      hardMax: 4200,
+      countingMode: "zh_chars",
+      normalizeMode: "compress",
+    });
+    const draft = "原始正文有完整句号。".repeat(400);
+
+    const result = await agent.normalizeChapter({
+      chapterContent: draft,
+      lengthSpec,
+    });
+
+    expect(chatSpy).toHaveBeenCalledTimes(1);
+    expect(result.normalizedContent).toBe(draft);
+    expect(result.warning).toContain("truncated");
+  });
+
+  it("keeps a complete in-range rewrite even when it ends without punctuation", async () => {
+    const agent = createAgent();
+    const rewrite = "完整正文".repeat(900);
+    const chatSpy = vi.spyOn(BaseAgent.prototype as never, "chat").mockResolvedValue({
+      content: rewrite,
+      usage: ZERO_USAGE,
+    });
+    const lengthSpec = LengthSpecSchema.parse({
+      target: 3500,
+      softMin: 3023,
+      softMax: 3977,
+      hardMin: 2800,
+      hardMax: 4200,
+      countingMode: "zh_chars",
+      normalizeMode: "compress",
+    });
+    const draft = "原始正文有完整句号。".repeat(500);
+
+    const result = await agent.normalizeChapter({
+      chapterContent: draft,
+      lengthSpec,
+    });
+
+    expect(chatSpy).toHaveBeenCalledTimes(1);
+    expect(result.normalizedContent).toBe(rewrite);
+    expect(result.warning).toBeUndefined();
   });
 
   it("strips explanatory wrappers from malformed normalizer output", async () => {

@@ -66,19 +66,13 @@ describe("ComposerAgent", () => {
         ],
         mustAvoid: ["Do not reveal the mastermind."],
         styleEmphasis: ["character conflict", "tight POV"],
-        conflicts: [
-          {
-            type: "outline_vs_request",
-            resolution: "allow local outline deferral",
-          },
-        ],
-        hookAgenda: {
-          pressureMap: [],
-          mustAdvance: [],
-          eligibleResolve: [],
-          staleDebt: [],
-          avoidNewHookFamilies: [],
-        },
+      },
+      memo: {
+        chapter: 4,
+        goal: "Bring the focus back to the mentor conflict.",
+        isGoldenOpening: false,
+        body: "",
+        threadRefs: [],
       },
       intentMarkdown: "# Chapter Intent\n",
       plannerInputs: [
@@ -112,7 +106,8 @@ describe("ComposerAgent", () => {
     });
 
     const selectedSources = result.contextPackage.selectedContext.map((entry) => entry.source);
-    expect(selectedSources.slice(0, 4)).toEqual([
+    expect(selectedSources.slice(0, 5)).toEqual([
+      "runtime/chapter_memo",
       "story/current_focus.md",
       "story/current_state.md",
       "story/story_bible.md",
@@ -138,10 +133,22 @@ describe("ComposerAgent", () => {
       plan,
     });
 
-    expect(result.ruleStack.sections.hard).toContain("story_bible");
+    // Phase hotfix 6: section names track Phase 5 authoritative paths.
+    expect(result.ruleStack.sections.hard).toContain("story_frame");
+    expect(result.ruleStack.sections.hard).toContain("roles");
     expect(result.ruleStack.sections.soft).toContain("author_intent");
+    expect(result.ruleStack.sections.soft).toContain("volume_map");
     expect(result.ruleStack.sections.diagnostic).toContain("anti_ai_checks");
-    expect(result.ruleStack.activeOverrides).toHaveLength(1);
+    // activeOverrides now derived from the plan: 1 mustAvoid + 2 styleEmphasis.
+    expect(result.ruleStack.activeOverrides.length).toBeGreaterThan(0);
+    const reasons = result.ruleStack.activeOverrides.map((o) => o.reason);
+    expect(reasons).toContain("Do not reveal the mastermind.");
+    expect(reasons).toContain("character conflict");
+    expect(reasons).toContain("tight POV");
+    // All overrides target the current chapter.
+    for (const override of result.ruleStack.activeOverrides) {
+      expect(override.target).toContain("chapter:4");
+    }
   });
 
   it("writes trace output describing planner inputs and selected sources", async () => {
@@ -161,8 +168,9 @@ describe("ComposerAgent", () => {
 
     expect(result.trace.plannerInputs).toEqual(plan.plannerInputs);
     expect(result.trace.selectedSources).toContain("story/current_focus.md");
-    expect(result.trace.notes).toContain("allow local outline deferral");
-    await expect(readFile(result.tracePath, "utf-8")).resolves.toContain("allow local outline deferral");
+    // trace.notes dropped with ChapterConflict removal (Phase 1 transitional)
+    expect(result.trace.notes).toEqual([]);
+    await expect(readFile(result.tracePath, "utf-8")).resolves.toContain("story/current_focus.md");
   });
 
   it("retrieves summary and hook evidence chunks instead of whole long memory files", async () => {
@@ -540,22 +548,12 @@ describe("ComposerAgent", () => {
           ...plan.intent,
           chapter: 10,
           goal: "Bring the focus back to the mentor oath conflict.",
-          hookAgenda: {
-            pressureMap: [{
-              hookId: "mentor-oath",
-              type: "relationship",
-              payoffTiming: "slow-burn",
-              phase: "middle",
-              pressure: "high",
-              movement: "partial-payoff",
-              reason: "stale-promise",
-              blockSiblingHooks: true,
-            }],
-            mustAdvance: ["mentor-oath"],
-            eligibleResolve: [],
-            staleDebt: [],
-            avoidNewHookFamilies: ["relationship"],
-          },
+        },
+        memo: {
+          ...plan.memo,
+          chapter: 10,
+          goal: "Bring the focus back to the mentor oath conflict.",
+          threadRefs: ["mentor-oath"],
         },
       },
     });
@@ -563,9 +561,67 @@ describe("ComposerAgent", () => {
     const hookDebtEntry = result.contextPackage.selectedContext.find((entry) => entry.source === "runtime/hook_debt#mentor-oath");
     expect(hookDebtEntry).toBeDefined();
     expect(hookDebtEntry?.excerpt).toContain("mentor-oath");
-    expect(hookDebtEntry?.excerpt).toContain("主要旧债");
+    expect(hookDebtEntry?.excerpt).toContain("备忘引用旧债");
     expect(hookDebtEntry?.excerpt).toContain("读者承诺");
     expect(hookDebtEntry?.excerpt).toContain("River Camp");
     expect(hookDebtEntry?.excerpt).toContain("Trial Echo");
+  });
+
+  it("includes memo-referenced hook ids in hook debt retrieval", async () => {
+    await Promise.all([
+      writeFile(
+        join(storyDir, "pending_hooks.md"),
+        [
+          "# Pending Hooks",
+          "",
+          "| hook_id | 起始章节 | 类型 | 状态 | 最近推进 | 预期回收 | 回收节奏 | 备注 |",
+          "| --- | --- | --- | --- | --- | --- | --- | --- |",
+          "| black-ring | 6 | mystery | open | 7 | 揭开黑戒来源 | 中程 | 这一根还没进旧 hookAgenda |",
+          "",
+        ].join("\n"),
+        "utf-8",
+      ),
+      writeFile(
+        join(storyDir, "chapter_summaries.md"),
+        [
+          "# Chapter Summaries",
+          "",
+          "| 6 | Black Ring | Lin Yue | Black ring first surfaces | Pressure rises | black-ring seeded | uneasy | mystery |",
+          "| 7 | Wet Dock | Lin Yue | Ring clue points to the dock | Stakes rise | black-ring advanced | tense | pursuit |",
+          "",
+        ].join("\n"),
+        "utf-8",
+      ),
+    ]);
+
+    const composer = new ComposerAgent({
+      client: {} as ConstructorParameters<typeof ComposerAgent>[0]["client"],
+      model: "test-model",
+      projectRoot: root,
+      bookId: book.id,
+    });
+
+    const result = await composer.composeChapter({
+      book,
+      bookDir,
+      chapterNumber: 8,
+      plan: {
+        ...plan,
+        intent: {
+          ...plan.intent,
+          chapter: 8,
+          goal: "Follow the black ring pressure.",
+          mustKeep: [],
+        },
+        memo: {
+          ...plan.memo,
+          chapter: 8,
+          goal: "Follow the black ring pressure.",
+          threadRefs: ["black-ring"],
+        },
+      },
+    });
+
+    expect(result.contextPackage.selectedContext.map((entry) => entry.source)).toContain("runtime/hook_debt#black-ring");
   });
 });

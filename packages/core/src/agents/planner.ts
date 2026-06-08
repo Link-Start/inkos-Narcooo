@@ -2,16 +2,40 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BaseAgent } from "./base.js";
 import type { BookConfig } from "../models/book.js";
-import { parseBookRules } from "../models/book-rules.js";
-import { ChapterIntentSchema, type ChapterConflict, type ChapterIntent } from "../models/input-governance.js";
+import { readBookRules as readAuthoritativeBookRules } from "./rules-reader.js";
 import {
-  parseChapterSummariesMarkdown,
+  ChapterIntentSchema,
+  type ChapterIntent,
+  type ChapterMemo,
+} from "../models/input-governance.js";
+import {
   renderHookSnapshot,
   renderSummarySnapshot,
-  retrieveMemorySelection,
 } from "../utils/memory-retrieval.js";
-import { analyzeChapterCadence } from "../utils/chapter-cadence.js";
-import { buildPlannerHookAgenda } from "../utils/hook-agenda.js";
+import {
+  gatherPlanningMaterials,
+  loadPlanningSeedMaterials,
+} from "../utils/planning-materials.js";
+import { parseMemo, PlannerParseError } from "../utils/chapter-memo-parser.js";
+import {
+  buildPlannerUserMessage,
+  getPlannerMemoSystemPrompt,
+} from "./planner-prompts.js";
+import {
+  composeCurrentArcProse,
+  extractCollaboratorRows,
+  extractOpponentRows,
+  extractProtagonistRow,
+  extractRelevantThreads,
+  formatRecentSummaries,
+  formatRecyclableHooks,
+  readBookRules,
+  readCharacterMatrix,
+  readEmotionalArcs,
+  readPendingHooks,
+  readSubplotBoard,
+} from "./planner-context.js";
+import type { StoredHook } from "../state/memory-db.js";
 
 export interface PlanChapterInput {
   readonly book: BookConfig;
@@ -22,11 +46,28 @@ export interface PlanChapterInput {
 
 export interface PlanChapterOutput {
   readonly intent: ChapterIntent;
+  readonly memo: ChapterMemo;
   readonly intentMarkdown: string;
   readonly plannerInputs: ReadonlyArray<string>;
   readonly runtimePath: string;
 }
 
+const MEMO_RETRY_LIMIT = 3;
+
+/**
+ * Phase 3 planner.
+ *
+ * Produces:
+ *   - a simplified ChapterIntent (goal + outline + keep/avoid/style) —
+ *     still deterministic, used for retrieval hints and the intent markdown.
+ *   - a full ChapterMemo (YAML frontmatter + 7-section markdown body) via
+ *     LLM call + strict parser.
+ *
+ * Retry policy: up to 3 attempts. Each failed parse appends an error
+ * feedback block to the user message and re-invokes the LLM. On the third
+ * failure we surface `PlannerParseError` — never silently truncate or
+ * rename fields.
+ */
 export class PlannerAgent extends BaseAgent {
   get name(): string {
     return "planner";
@@ -37,83 +78,84 @@ export class PlannerAgent extends BaseAgent {
     const runtimeDir = join(storyDir, "runtime");
     await mkdir(runtimeDir, { recursive: true });
 
-    const sourcePaths = {
-      authorIntent: join(storyDir, "author_intent.md"),
-      currentFocus: join(storyDir, "current_focus.md"),
-      storyBible: join(storyDir, "story_bible.md"),
-      volumeOutline: join(storyDir, "volume_outline.md"),
-      chapterSummaries: join(storyDir, "chapter_summaries.md"),
-      bookRules: join(storyDir, "book_rules.md"),
-      currentState: join(storyDir, "current_state.md"),
-    } as const;
-
-    const [
-      authorIntent,
-      currentFocus,
-      storyBible,
-      volumeOutline,
-      chapterSummaries,
-      bookRulesRaw,
-      currentState,
-    ] = await Promise.all([
-      this.readFileOrDefault(sourcePaths.authorIntent),
-      this.readFileOrDefault(sourcePaths.currentFocus),
-      this.readFileOrDefault(sourcePaths.storyBible),
-      this.readFileOrDefault(sourcePaths.volumeOutline),
-      this.readFileOrDefault(sourcePaths.chapterSummaries),
-      this.readFileOrDefault(sourcePaths.bookRules),
-      this.readFileOrDefault(sourcePaths.currentState),
-    ]);
-
-    const outlineNode = this.findOutlineNode(volumeOutline, input.chapterNumber);
-    const matchedOutlineAnchor = this.hasMatchedOutlineAnchor(volumeOutline, input.chapterNumber);
-    const goal = this.deriveGoal(input.externalContext, currentFocus, authorIntent, outlineNode, input.chapterNumber);
-    const parsedRules = parseBookRules(bookRulesRaw);
-    const mustKeep = this.collectMustKeep(currentState, storyBible);
-    const mustAvoid = this.collectMustAvoid(currentFocus, parsedRules.rules.prohibitions);
-    const styleEmphasis = this.collectStyleEmphasis(authorIntent, currentFocus);
-    const conflicts = this.collectConflicts(input.externalContext, currentFocus, outlineNode, volumeOutline);
-    const planningAnchor = conflicts.length > 0 ? undefined : outlineNode;
-    const memorySelection = await retrieveMemorySelection({
+    const seedMaterials = await loadPlanningSeedMaterials({
+      bookDir: input.bookDir,
+      chapterNumber: input.chapterNumber,
+    });
+    const outlineNode = this.findOutlineNode(seedMaterials.volumeOutline, input.chapterNumber);
+    const goal = this.deriveGoal(
+      input.externalContext,
+      seedMaterials.currentFocus,
+      seedMaterials.authorIntent,
+      outlineNode,
+      input.chapterNumber,
+    );
+    // Phase hotfix 5: read structured rules through the Phase 5 authoritative
+    // loader. It prefers outline/story_frame.md frontmatter, falls back to
+    // legacy book_rules.md, and refuses to silently zero out rules when the
+    // legacy file is just a compat shim. Reading raw bookRulesRaw via
+    // parseBookRules() bypassed all of that.
+    const parsedRules = await readAuthoritativeBookRules(input.bookDir);
+    const prohibitions = parsedRules?.rules.prohibitions ?? [];
+    const mustKeep = this.collectMustKeep(seedMaterials.currentState, seedMaterials.storyBible);
+    const mustAvoid = this.collectMustAvoid(seedMaterials.currentFocus, prohibitions);
+    const styleEmphasis = this.collectStyleEmphasis(seedMaterials.authorIntent, seedMaterials.currentFocus);
+    const materials = await gatherPlanningMaterials({
       bookDir: input.bookDir,
       chapterNumber: input.chapterNumber,
       goal,
-      outlineNode: planningAnchor,
+      outlineNode,
       mustKeep,
+      seed: seedMaterials,
     });
+    const memorySelection = materials.memorySelection;
     const activeHookCount = memorySelection.activeHooks.filter(
       (hook) => hook.status !== "resolved" && hook.status !== "deferred",
     ).length;
-    const hookAgenda = buildPlannerHookAgenda({
-      hooks: memorySelection.activeHooks,
-      chapterNumber: input.chapterNumber,
-      targetChapters: input.book.targetChapters,
-      language: input.book.language ?? "zh",
-    });
-    const directives = this.buildStructuredDirectives({
-      chapterNumber: input.chapterNumber,
-      language: input.book.language,
-      volumeOutline,
+
+    const arcContext = this.buildArcContext(
+      input.book.language,
+      seedMaterials.volumeOutline,
       outlineNode,
-      matchedOutlineAnchor,
-      chapterSummaries,
-    });
+    );
 
     const intent = ChapterIntentSchema.parse({
       chapter: input.chapterNumber,
       goal,
       outlineNode,
-      ...directives,
+      arcContext,
       mustKeep,
       mustAvoid,
       styleEmphasis,
-      conflicts,
-      hookAgenda,
     });
+
+    const isGoldenOpening = this.isGoldenOpeningChapter(input.book.language, input.chapterNumber);
+    const memo = await this.planChapterMemo({
+      storyDir,
+      bookDir: input.bookDir,
+      chapterNumber: input.chapterNumber,
+      isGoldenOpening,
+      fallbackGoal: goal,
+      chapterSummariesRaw: seedMaterials.chapterSummariesRaw,
+      previousEndingExcerpt: seedMaterials.previousEndingExcerpt,
+      brief: seedMaterials.brief,
+      chapterContext: input.externalContext,
+      recyclableHooks: memorySelection.recyclableHooks,
+      // Phase hotfix 4: thread book language through so the planner uses
+      // English prompts (system + user template + golden opening guidance)
+      // for English books instead of always-Chinese.
+      language: input.book.language ?? "zh",
+    });
+
+    // memo.goal is LLM-produced and specific (<=50 chars, validated).
+    // Overwrite intent.goal so downstream composer/retrieval gets the
+    // concrete task statement instead of the outline-derived fallback.
+    intent.goal = memo.goal;
 
     const runtimePath = join(runtimeDir, `chapter-${String(input.chapterNumber).padStart(4, "0")}.intent.md`);
     const intentMarkdown = this.renderIntentMarkdown(
       intent,
+      memo,
       input.book.language ?? "zh",
       renderHookSnapshot(memorySelection.hooks, input.book.language ?? "zh"),
       renderSummarySnapshot(memorySelection.summaries, input.book.language ?? "zh"),
@@ -123,49 +165,120 @@ export class PlannerAgent extends BaseAgent {
 
     return {
       intent,
+      memo,
       intentMarkdown,
-      plannerInputs: [
-        ...Object.values(sourcePaths),
-        join(storyDir, "pending_hooks.md"),
-        ...(memorySelection.dbPath ? [memorySelection.dbPath] : []),
-      ],
+      plannerInputs: materials.plannerInputs,
       runtimePath,
     };
   }
 
-  private buildStructuredDirectives(input: {
+  /**
+   * Invoke the LLM to produce a 7-section memo and parse it. Retries up to
+   * 3 times on parse failure, injecting the error message back into the user
+   * prompt so the LLM can correct itself.
+   */
+  async planChapterMemo(input: {
+    readonly storyDir: string;
+    readonly bookDir: string;
     readonly chapterNumber: number;
-    readonly language?: string;
-    readonly volumeOutline: string;
-    readonly outlineNode: string | undefined;
-    readonly matchedOutlineAnchor: boolean;
-    readonly chapterSummaries: string;
-  }): Pick<ChapterIntent, "sceneDirective" | "arcDirective" | "moodDirective" | "titleDirective"> {
-    const recentSummaries = parseChapterSummariesMarkdown(input.chapterSummaries)
-      .filter((summary) => summary.chapter < input.chapterNumber)
-      .sort((left, right) => left.chapter - right.chapter)
-      .slice(-4);
-    const cadence = analyzeChapterCadence({
-      language: this.isChineseLanguage(input.language) ? "zh" : "en",
-      rows: recentSummaries.map((summary) => ({
-        chapter: summary.chapter,
-        title: summary.title,
-        mood: summary.mood,
-        chapterType: summary.chapterType,
-      })),
+    readonly isGoldenOpening: boolean;
+    readonly fallbackGoal: string;
+    readonly chapterSummariesRaw: string;
+    readonly previousEndingExcerpt?: string;
+    readonly brief?: string;
+    readonly chapterContext?: string;
+    readonly recyclableHooks?: ReadonlyArray<StoredHook>;
+    readonly language?: "zh" | "en";
+  }): Promise<ChapterMemo> {
+    const [characterMatrix, subplotBoard, emotionalArcs, pendingHooks, bookRulesRaw] = await Promise.all([
+      readCharacterMatrix(input.storyDir),
+      readSubplotBoard(input.storyDir),
+      readEmotionalArcs(input.storyDir),
+      readPendingHooks(input.storyDir),
+      readBookRules(input.storyDir),
+    ]);
+
+    const language = input.language ?? "zh";
+    const noPriorChapter = language === "en"
+      ? "(this is the opening chapter — no prior chapter)"
+      : "（本章为起始章，无前章）";
+    const noBookRules = language === "en"
+      ? "(no book_rules entries)"
+      : "（暂无 book_rules 条目）";
+    const retryFeedbackHeader = language === "en"
+      ? "## Error from previous output"
+      : "## 上次输出的错误";
+    const retryFeedbackTrailer = language === "en"
+      ? "Fix and re-emit."
+      : "请修正后重新输出。";
+
+    const userMessage = buildPlannerUserMessage({
+      chapterNumber: input.chapterNumber,
+      previousChapterEndingExcerpt: input.previousEndingExcerpt?.trim()
+        ? input.previousEndingExcerpt.trim()
+        : noPriorChapter,
+      recentSummaries: formatRecentSummaries(input.chapterSummariesRaw, input.chapterNumber, 3),
+      currentArcProse: composeCurrentArcProse(subplotBoard, emotionalArcs, input.chapterNumber),
+      protagonistMatrixRow: extractProtagonistRow(characterMatrix),
+      opponentRows: extractOpponentRows(characterMatrix, 3),
+      collaboratorRows: extractCollaboratorRows(characterMatrix, 3),
+      relevantThreads: extractRelevantThreads(pendingHooks, subplotBoard),
+      recyclableHooks: formatRecyclableHooks(
+        input.recyclableHooks ?? [],
+        input.chapterNumber,
+        language,
+      ),
+      isGoldenOpening: input.isGoldenOpening,
+      bookRulesRelevant: bookRulesRaw.trim().length > 0 ? bookRulesRaw.trim() : noBookRules,
+      brief: input.brief ?? "",
+      chapterContext: input.chapterContext ?? "",
+      language,
     });
 
-    return {
-      arcDirective: this.buildArcDirective(
-        input.language,
-        input.volumeOutline,
-        input.outlineNode,
-        input.matchedOutlineAnchor,
-      ),
-      sceneDirective: this.buildSceneDirective(input.language, cadence),
-      moodDirective: this.buildMoodDirective(input.language, cadence),
-      titleDirective: this.buildTitleDirective(input.language, cadence),
-    };
+    const systemPrompt = getPlannerMemoSystemPrompt(language);
+
+    let currentUserMessage = userMessage;
+    let lastError: PlannerParseError | undefined;
+
+    for (let attempt = 0; attempt < MEMO_RETRY_LIMIT; attempt += 1) {
+      const response = await this.chat(
+        [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: currentUserMessage },
+        ],
+        { temperature: 0.7 },
+      );
+
+      try {
+        return parseMemo(response.content, input.chapterNumber, input.isGoldenOpening);
+      } catch (error) {
+        if (!(error instanceof PlannerParseError)) {
+          throw error;
+        }
+        lastError = error;
+        this.log?.warn(`[planner] memo parse failed (attempt ${attempt + 1}/${MEMO_RETRY_LIMIT}): ${error.message}`);
+        currentUserMessage = `${userMessage}\n\n${retryFeedbackHeader}\n${error.message}\n${retryFeedbackTrailer}`;
+      }
+    }
+
+    throw lastError ?? new PlannerParseError("memo planner exhausted retries without a specific error");
+  }
+
+  private isGoldenOpeningChapter(language: string | undefined, chapterNumber: number): boolean {
+    const isZh = (language ?? "zh").toLowerCase().startsWith("zh");
+    return isZh ? chapterNumber <= 3 : chapterNumber <= 5;
+  }
+
+  private buildArcContext(
+    language: string | undefined,
+    volumeOutline: string,
+    outlineNode: string | undefined,
+  ): string | undefined {
+    if (!outlineNode) return undefined;
+    if (volumeOutline === "(文件尚未创建)") return undefined;
+    return this.isChineseLanguage(language)
+      ? `卷纲节点：${outlineNode}`
+      : `Outline node: ${outlineNode}`;
   }
 
   private deriveGoal(
@@ -223,40 +336,6 @@ export class PlannerAgent extends BaseAgent {
       ...this.extractFocusStyleItems(currentFocus),
       ...this.extractListItems(authorIntent, 2),
     ]).slice(0, 4);
-  }
-
-  private collectConflicts(
-    externalContext: string | undefined,
-    currentFocus: string,
-    outlineNode: string | undefined,
-    volumeOutline: string,
-  ): ChapterConflict[] {
-    const outlineText = outlineNode ?? volumeOutline;
-    if (!outlineText || outlineText === "(文件尚未创建)") return [];
-    if (externalContext) {
-      const indicatesOverride = /ignore|skip|defer|instead|不要|别|先别|暂停/i.test(externalContext);
-      if (!indicatesOverride && this.hasKeywordOverlap(externalContext, outlineText)) return [];
-
-      return [
-        {
-          type: "outline_vs_request",
-          resolution: "allow local outline deferral",
-        },
-      ];
-    }
-
-    const localOverride = this.extractLocalOverrideGoal(currentFocus);
-    if (!localOverride || !outlineNode) {
-      return [];
-    }
-
-    return [
-      {
-        type: "outline_vs_current_focus",
-        resolution: "allow explicit current focus override",
-        detail: localOverride,
-      },
-    ];
   }
 
   private extractFirstDirective(content?: string): string | undefined {
@@ -329,63 +408,6 @@ export class PlannerAgent extends BaseAgent {
       "近期聚焦",
     ]) ?? currentFocus;
     return this.extractListItems(focusSection, limit);
-  }
-
-  private buildArcDirective(
-    language: string | undefined,
-    volumeOutline: string,
-    outlineNode: string | undefined,
-    matchedOutlineAnchor: boolean,
-  ): string | undefined {
-    if (matchedOutlineAnchor || !outlineNode || volumeOutline === "(文件尚未创建)") {
-      return undefined;
-    }
-
-    return this.isChineseLanguage(language)
-      ? "不要继续依赖卷纲的 fallback 指令，必须把本章推进到新的弧线节点或地点变化。"
-      : "Do not keep leaning on the outline fallback. Force this chapter toward a fresh arc beat or location change.";
-  }
-
-  private buildSceneDirective(
-    language: string | undefined,
-    cadence: ReturnType<typeof analyzeChapterCadence>,
-  ): string | undefined {
-    if (cadence.scenePressure?.pressure !== "high") {
-      return undefined;
-    }
-    const repeatedType = cadence.scenePressure.repeatedType;
-
-    return this.isChineseLanguage(language)
-      ? `最近章节连续停留在“${repeatedType}”，本章必须更换场景容器、地点或行动方式。`
-      : `Recent chapters are stuck in repeated ${repeatedType} beats. Change the scene container, location, or action pattern this chapter.`;
-  }
-
-  private buildMoodDirective(
-    language: string | undefined,
-    cadence: ReturnType<typeof analyzeChapterCadence>,
-  ): string | undefined {
-    if (cadence.moodPressure?.pressure !== "high") {
-      return undefined;
-    }
-    const moods = cadence.moodPressure.recentMoods;
-
-    return this.isChineseLanguage(language)
-      ? `最近${moods.length}章情绪持续高压（${moods.slice(0, 3).join("、")}），本章必须降调——安排日常/喘息/温情/幽默场景，让读者呼吸。`
-      : `The last ${moods.length} chapters have been relentlessly tense (${moods.slice(0, 3).join(", ")}). This chapter must downshift — write a quieter scene with warmth, humor, or breathing room.`;
-  }
-
-  private buildTitleDirective(
-    language: string | undefined,
-    cadence: ReturnType<typeof analyzeChapterCadence>,
-  ): string | undefined {
-    if (cadence.titlePressure?.pressure !== "high") {
-      return undefined;
-    }
-    const repeatedToken = cadence.titlePressure.repeatedToken;
-
-    return this.isChineseLanguage(language)
-      ? `标题不要再围绕“${repeatedToken}”重复命名，换一个新的意象或动作焦点。`
-      : `Avoid another ${repeatedToken}-centric title. Pick a new image or action focus for this chapter title.`;
   }
 
   private renderHookBudget(activeCount: number, language: "zh" | "en"): string {
@@ -492,6 +514,14 @@ export class PlannerAgent extends BaseAgent {
         return inlineContent;
       }
 
+      const rangeStart = Number(match[1]);
+      const sectionContent = this.extractSectionAroundRange(lines, index);
+      if (sectionContent) {
+        const beatIndex = chapterNumber - rangeStart;
+        const specificBeat = this.extractNumberedBeat(sectionContent, beatIndex);
+        return specificBeat ?? sectionContent;
+      }
+
       const nextContent = this.findNextOutlineContent(lines, index + 1);
       if (nextContent) {
         return nextContent;
@@ -536,6 +566,55 @@ export class PlannerAgent extends BaseAgent {
     return cleaned;
   }
 
+  private extractSectionAroundRange(lines: ReadonlyArray<string>, rangeLineIndex: number): string | undefined {
+    let headingIndex = -1;
+    for (let i = rangeLineIndex - 1; i >= 0; i--) {
+      if (lines[i]!.startsWith("#")) {
+        headingIndex = i;
+        break;
+      }
+      if (this.matchAnyRangeOutlineLine(lines[i]!) || this.matchAnyExactOutlineLine(lines[i]!)) {
+        break;
+      }
+    }
+
+    if (headingIndex < 0) {
+      return undefined;
+    }
+
+    const headingLine = lines[headingIndex]!;
+    const headingLevel = headingLine.match(/^(#+)/)?.[1]?.length ?? 3;
+
+    const sectionLines: string[] = [];
+    for (let i = headingIndex; i < lines.length; i++) {
+      if (i > headingIndex) {
+        const nextHeadingMatch = lines[i]!.match(/^(#+)/);
+        if (nextHeadingMatch && (nextHeadingMatch[1]?.length ?? 0) <= headingLevel) {
+          break;
+        }
+      }
+      sectionLines.push(lines[i]!);
+    }
+
+    const content = sectionLines.join("\n").trim();
+    return content.length > 0 ? content : undefined;
+  }
+
+  private extractNumberedBeat(section: string, beatIndex: number): string | undefined {
+    if (beatIndex < 0) return undefined;
+
+    const beats: string[] = [];
+    for (const line of section.split("\n")) {
+      const trimmed = line.trim();
+      if (/^\d+[.)]\s/.test(trimmed)) {
+        beats.push(trimmed.replace(/^\d+[.)]\s*/, ""));
+      }
+    }
+
+    if (beats.length === 0 || beatIndex >= beats.length) return undefined;
+    return beats[beatIndex];
+  }
+
   private findNextOutlineContent(lines: ReadonlyArray<string>, startIndex: number): string | undefined {
     for (let index = startIndex; index < lines.length; index += 1) {
       const line = lines[index]!;
@@ -558,14 +637,6 @@ export class PlannerAgent extends BaseAgent {
     }
 
     return undefined;
-  }
-
-  private hasMatchedOutlineAnchor(volumeOutline: string, chapterNumber: number): boolean {
-    const lines = volumeOutline.split("\n").map((line) => line.trim()).filter(Boolean);
-    return lines.some((line) =>
-      this.matchExactOutlineLine(line, chapterNumber) !== undefined
-      || this.matchRangeOutlineLine(line, chapterNumber) !== undefined,
-    );
   }
 
   private matchExactOutlineLine(line: string, chapterNumber: number): RegExpMatchArray | undefined {
@@ -604,6 +675,8 @@ export class PlannerAgent extends BaseAgent {
     const patterns = [
       /^(?:#+\s*)?(?:[-*]\s+)?(?:\*\*)?Chapter\s*(\d+)\s*[-~–—]\s*(\d+)\b(?:[:：-])?(?:\*\*)?\s*(.*)$/i,
       /^(?:#+\s*)?(?:[-*]\s+)?(?:\*\*)?第\s*(\d+)\s*[-~–—]\s*(\d+)\s*章(?:[:：-])?(?:\*\*)?\s*(.*)$/i,
+      /^(?:[-*]\s+)?(?:\*\*)?章节范围(?:\*\*)?[：:]\s*(\d+)\s*[-~–—]\s*(\d+)\s*章\s*(.*)$/,
+      /^(?:[-*]\s+)?(?:\*\*)?Chapter\s*[Rr]ange(?:\*\*)?[：:]\s*(\d+)\s*[-~–—]\s*(\d+)\b\s*(.*)$/i,
     ];
 
     return patterns
@@ -625,30 +698,14 @@ export class PlannerAgent extends BaseAgent {
     return chapterNumber >= lower && chapterNumber <= upper;
   }
 
-  private hasKeywordOverlap(left: string, right: string): boolean {
-    const keywords = this.extractKeywords(left);
-    if (keywords.length === 0) return false;
-    const normalizedRight = right.toLowerCase();
-    return keywords.some((keyword) => normalizedRight.includes(keyword.toLowerCase()));
-  }
-
-  private extractKeywords(content: string): string[] {
-    const english = content.match(/[a-z]{4,}/gi) ?? [];
-    const chinese = content.match(/[\u4e00-\u9fff]{2,4}/g) ?? [];
-    return this.unique([...english, ...chinese]);
-  }
-
   private renderIntentMarkdown(
     intent: ChapterIntent,
+    memo: ChapterMemo,
     language: "zh" | "en",
     pendingHooks: string,
     chapterSummaries: string,
     activeHookCount: number,
   ): string {
-    const conflictLines = intent.conflicts.length > 0
-      ? intent.conflicts.map((conflict) => `- ${conflict.type}: ${conflict.resolution}`).join("\n")
-      : "- none";
-
     const mustKeep = intent.mustKeep.length > 0
       ? intent.mustKeep.map((item) => `- ${item}`).join("\n")
       : "- none";
@@ -660,35 +717,11 @@ export class PlannerAgent extends BaseAgent {
     const styleEmphasis = intent.styleEmphasis.length > 0
       ? intent.styleEmphasis.map((item) => `- ${item}`).join("\n")
       : "- none";
-    const directives = [
-      intent.arcDirective ? `- arc: ${intent.arcDirective}` : undefined,
-      intent.sceneDirective ? `- scene: ${intent.sceneDirective}` : undefined,
-      intent.moodDirective ? `- mood: ${intent.moodDirective}` : undefined,
-      intent.titleDirective ? `- title: ${intent.titleDirective}` : undefined,
-    ].filter(Boolean).join("\n") || "- none";
-    const hookAgenda = [
-      "### Must Advance",
-      intent.hookAgenda.mustAdvance.length > 0
-        ? intent.hookAgenda.mustAdvance.map((item) => `- ${item}`).join("\n")
-        : "- none",
-      "",
-      "### Eligible Resolve",
-      intent.hookAgenda.eligibleResolve.length > 0
-        ? intent.hookAgenda.eligibleResolve.map((item) => `- ${item}`).join("\n")
-        : "- none",
-      "",
-      "### Stale Debt",
-      intent.hookAgenda.staleDebt.length > 0
-        ? intent.hookAgenda.staleDebt.map((item) => `- ${item}`).join("\n")
-        : "- none",
-      "",
-      "### Avoid New Hook Families",
-      intent.hookAgenda.avoidNewHookFamilies.length > 0
-        ? intent.hookAgenda.avoidNewHookFamilies.map((item) => `- ${item}`).join("\n")
-        : "- none",
-      "",
-      this.renderHookBudget(activeHookCount, language),
-    ].join("\n");
+
+    const memoBody = memo.body.trim();
+    const threadRefsLine = memo.threadRefs.length > 0
+      ? memo.threadRefs.map((id) => `- ${id}`).join("\n")
+      : "- (none)";
 
     return [
       "# Chapter Intent",
@@ -699,6 +732,9 @@ export class PlannerAgent extends BaseAgent {
       "## Outline Node",
       intent.outlineNode ?? "(not found)",
       "",
+      "## Arc Context",
+      intent.arcContext ?? "(none)",
+      "",
       "## Must Keep",
       mustKeep,
       "",
@@ -708,14 +744,16 @@ export class PlannerAgent extends BaseAgent {
       "## Style Emphasis",
       styleEmphasis,
       "",
-      "## Structured Directives",
-      directives,
+      "## Chapter Memo",
+      `- isGoldenOpening: ${memo.isGoldenOpening ? "true" : "false"}`,
       "",
-      "## Hook Agenda",
-      hookAgenda,
+      "### Thread Refs",
+      threadRefsLine,
       "",
-      "## Conflicts",
-      conflictLines,
+      "### Body",
+      memoBody,
+      "",
+      this.renderHookBudget(activeHookCount, language),
       "",
       "## Pending Hooks Snapshot",
       pendingHooks,
@@ -734,7 +772,8 @@ export class PlannerAgent extends BaseAgent {
     return (language ?? "zh").toLowerCase().startsWith("zh");
   }
 
-  private async readFileOrDefault(path: string): Promise<string> {
+  // Kept for potential subclasses reading seed files directly.
+  protected async readFileOrDefault(path: string): Promise<string> {
     try {
       return await readFile(path, "utf-8");
     } catch {
