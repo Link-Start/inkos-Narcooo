@@ -377,10 +377,14 @@ inkos compose chapter 吞天魔帝
 
 InkOS 现在有两条主要运行线：长篇 / 短篇生产线负责生成可交付文本；Play 运行线负责持续互动世界。它们共享模型配置、Studio Chat、确认动作和产物预览，但状态结构不同。
 
+<p align="center">
+  <img src="assets/arch-system.svg" width="900" alt="整体系统架构">
+</p>
+
 长篇每一章默认按“规划 → 编排 → 写作 → 审计 → 必要修订 → 状态同步”运行：
 
 <p align="center">
-  <img src="assets/screenshot-pipeline.png" width="800" alt="管线流程图">
+  <img src="assets/arch-pipeline.svg" width="900" alt="章节生产管线">
 </p>
 
 | Agent | 职责 |
@@ -415,7 +419,7 @@ Settler 不再要求模型输出完整 markdown 文件，而是输出 JSON delta
 Node 22+ 环境下自动启用 SQLite 时序记忆数据库（`story/memory.db`），支持按相关性检索历史事实、伏笔和章节摘要，避免全量注入导致的上下文膨胀。
 
 <p align="center">
-  <img src="assets/screenshot-state.png" width="800" alt="长期记忆快照">
+  <img src="assets/arch-memory.svg" width="900" alt="长期记忆与状态">
 </p>
 
 ### 控制面与运行时产物
