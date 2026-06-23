@@ -1,6 +1,10 @@
 import { Type, type Static } from "@mariozechner/pi-ai";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import { applyGraphDelta } from "../interactive-film/authoring-store.js";
+import { chatCompletion, type LLMClient } from "../llm/provider.js";
+import { loadStoryGraph } from "../interactive-film/graph-store.js";
+import { buildFilmAuthoringContext } from "../interactive-film/film-context.js";
+import { buildFillNodeDeltaFromLLMText } from "../interactive-film/authoring-generate.js";
 import {
   buildWorldAnchorDelta,
   buildAddVariableDelta,
@@ -151,4 +155,74 @@ export function createUpsertCharactersTool(projectRoot: string, projectId: strin
       return textResult(`Upserted ${chars.length} character(s) (rev ${rev}).`, { kind: "graph_updated", rev });
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// LLM-backed fill_node / revise_node
+// ---------------------------------------------------------------------------
+
+export interface FilmLLMDeps {
+  readonly chat: (system: string, user: string) => Promise<string>;
+}
+
+function defaultChat(client: LLMClient, model: string): FilmLLMDeps["chat"] {
+  return async (system, user) => {
+    const res = await chatCompletion(client, model, [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ], { temperature: 0.6, maxTokens: 4000 });
+    return res.content;
+  };
+}
+
+const FillNodeParams = Type.Object({
+  nodeId: Type.String({ description: "the node to fill/rewrite" }),
+  instruction: Type.String({ description: "what this scene should contain (beats, who speaks, choices)" }),
+});
+
+const NODE_SYSTEM = `你是互动影游编剧。根据当前图上下文和指令，为指定节点生成 JSON（单个 StoryNode：type/title/sceneDesc/dialogue[]/choices[]），只输出 JSON。choices[].targetNodeId 必须指向已存在的节点 id。`;
+
+export function createFillNodeTool(
+  projectRoot: string,
+  projectId: string,
+  deps: FilmLLMDeps,
+): AgentTool<typeof FillNodeParams> {
+  return {
+    name: "fill_node",
+    description: "interactive-film authoring: write/rewrite one node's scene, dialogue and choices via the model. Applies immediately.",
+    label: "Fill Node",
+    parameters: FillNodeParams,
+    async execute(_id, params: Static<typeof FillNodeParams>) {
+      const graph = await loadStoryGraph(projectRoot, projectId);
+      const context = graph ? buildFilmAuthoringContext(graph) : "(empty graph)";
+      const text = await deps.chat(NODE_SYSTEM, `${context}\n\n要填的节点 id：${params.nodeId}\n指令：${params.instruction}`);
+      const { rev } = await applyGraphDelta({ projectRoot, projectId, delta: buildFillNodeDeltaFromLLMText(text, params.nodeId), phase: "workshop" });
+      return textResult(`Node ${params.nodeId} filled (rev ${rev}).`, { kind: "graph_updated", rev });
+    },
+  };
+}
+
+export function createReviseNodeTool(
+  projectRoot: string,
+  projectId: string,
+  deps: FilmLLMDeps,
+): AgentTool<typeof FillNodeParams> {
+  return {
+    name: "revise_node",
+    description: "interactive-film authoring: revise one existing node per instruction. Applies immediately.",
+    label: "Revise Node",
+    parameters: FillNodeParams,
+    async execute(_id, params: Static<typeof FillNodeParams>) {
+      const graph = await loadStoryGraph(projectRoot, projectId);
+      const context = graph ? buildFilmAuthoringContext(graph) : "(empty graph)";
+      const current = graph?.nodes.find((n) => n.id === params.nodeId);
+      const text = await deps.chat(NODE_SYSTEM, `${context}\n\n要修改的节点 id：${params.nodeId}\n现有内容：${JSON.stringify(current ?? {})}\n修改指令：${params.instruction}`);
+      const { rev } = await applyGraphDelta({ projectRoot, projectId, delta: buildFillNodeDeltaFromLLMText(text, params.nodeId), phase: "workshop" });
+      return textResult(`Node ${params.nodeId} revised (rev ${rev}).`, { kind: "graph_updated", rev });
+    },
+  };
+}
+
+export function filmLLMDepsFromClient(client: LLMClient, model: string): FilmLLMDeps {
+  return { chat: defaultChat(client, model) };
 }
