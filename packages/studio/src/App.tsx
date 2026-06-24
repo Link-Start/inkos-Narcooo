@@ -99,6 +99,7 @@ export function App() {
     toPlay: (projectId: string) => setRoute({ page: "play", projectId }),
     toFilm: (projectId: string) => setRoute({ page: "film", projectId }),
     toFlow: (projectId: string) => setRoute({ page: "flow", projectId }),
+    toFilmAuthor: (projectId: string) => setRoute({ page: "film-author", projectId }),
   };
 
   const activeBookId = deriveActiveBookId(route);
@@ -327,6 +328,18 @@ export function App() {
           {route.page === "film" && (
             <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
               <StoryGraphTree projectId={route.projectId} nav={nav} theme={theme} t={t} />
+            </div>
+          )}
+          {route.page === "film-author" && (
+            <div className="absolute inset-0 flex min-w-0">
+              <ChatPage
+                activeBookId={route.projectId}
+                mode="interactive-film-authoring"
+                nav={nav}
+                theme={theme}
+                t={t}
+                sse={sse}
+              />
             </div>
           )}
           {route.page === "flow" && (

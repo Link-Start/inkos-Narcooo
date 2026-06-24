@@ -9,6 +9,7 @@ interface Nav {
   toDashboard: () => void;
   toPlay: (id: string) => void;
   toFlow: (id: string) => void;
+  toFilmAuthor: (id: string) => void;
 }
 
 interface ValidationReport {
@@ -89,6 +90,13 @@ export function StoryGraphTree({
           data-testid="open-flow"
         >
           流程图 →
+        </button>
+        <button
+          onClick={() => nav.toFilmAuthor(projectId)}
+          className="px-3 py-1 rounded bg-emerald-600 text-white"
+          data-testid="open-authoring"
+        >
+          AI 对话创作 →
         </button>
       </div>
 

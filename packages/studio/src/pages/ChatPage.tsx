@@ -64,7 +64,7 @@ interface Nav {
 
 export interface ChatPageProps {
   readonly activeBookId?: string;
-  readonly mode?: "book" | "book-create" | "project-chat";
+  readonly mode?: "book" | "book-create" | "project-chat" | "interactive-film-authoring";
   readonly nav: Nav;
   readonly theme: Theme;
   readonly t: TFunction;
@@ -121,7 +121,9 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
   const isZh = t("nav.connected") === "\u5DF2\u8FDE\u63A5";
   const hasBook = Boolean(activeBookId);
   const currentSessionKind: ChatSessionKind = activeSession?.sessionKind
-    ?? (mode === "book-create" ? "book-create" : activeBookId ? "book" : "chat");
+    ?? (mode === "interactive-film-authoring" ? "interactive-film-authoring"
+      : mode === "book-create" ? "book-create"
+      : activeBookId ? "book" : "chat");
   const playMode = activeSession?.playMode;
   // A play session must pick its playstyle (点着玩 / 自由玩) before chatting.
   const needsPlayModeChoice = currentSessionKind === "play" && !playMode;
@@ -288,7 +290,7 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
           return;
         }
 
-        await createSession(activeBookId, "book");
+        await createSession(activeBookId, mode === "interactive-film-authoring" ? "interactive-film-authoring" : "book");
         return;
       }
 
