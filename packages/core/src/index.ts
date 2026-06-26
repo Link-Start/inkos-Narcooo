@@ -591,3 +591,5 @@ export {
   analyzeEmotionalArcs,
   analyzePathDistribution,
 } from "./interactive-film/emotion.js";
+export { exportInk } from "./interactive-film/export-ink.js";
+export { buildPlayableHtml } from "./interactive-film/export-html.js";
