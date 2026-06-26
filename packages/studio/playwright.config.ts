@@ -9,6 +9,12 @@ export default defineConfig({
   // test server.  See e2e/global-setup.ts for details.
   globalSetup: "./e2e/global-setup.ts",
   timeout: 60_000,
+  // Run specs serially against the single shared dev server. The authoring
+  // agent flow streams a long SSE turn; with parallel workers, concurrent
+  // specs hammering the one server starve that turn into a 60s timeout (the
+  // spec passes alone but flakes in a parallel full run). Serial is both
+  // reliable and faster here (one backend, no contention).
+  workers: 1,
   use: {
     baseURL: "http://localhost:4580",
     headless: true,
