@@ -219,7 +219,7 @@ export function getGeneratedArtifactDetails(exec: ToolExecution): GeneratedArtif
   };
 }
 
-function ScriptStoryboardResultPreview({ exec, onOpenFilm, onOpenFilmStudio }: { exec: ToolExecution; onOpenFilm?: (projectId: string) => void; onOpenFilmStudio?: (projectId: string) => void }) {
+function ScriptStoryboardResultPreview({ exec, onOpenFilmStudio }: { exec: ToolExecution; onOpenFilmStudio?: (projectId: string) => void }) {
   const openProjectArtifact = useChatStore((s) => s.openProjectArtifact);
   if (!["script_create", "storyboard_create", "interactive_film_create"].includes(exec.tool) || exec.status !== "completed") return null;
   const details = getGeneratedArtifactDetails(exec);
@@ -678,7 +678,7 @@ function PipelineExecution({
         onRejectProposedAction={onRejectProposedAction}
       />
       <ShortFictionResultPreview exec={exec} />
-      <ScriptStoryboardResultPreview exec={exec} onOpenFilm={onOpenFilm} onOpenFilmStudio={onOpenFilmStudio} />
+      <ScriptStoryboardResultPreview exec={exec} onOpenFilmStudio={onOpenFilmStudio} />
       <PlayResultPreview exec={exec} />
       <PlayEditPreview exec={exec} />
       {typeof exec.result === "string" && exec.result.trim() && (

@@ -1,5 +1,463 @@
-// Minimal placeholder — Task 4 replaces this with the full wizard shell.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export default function FilmWizard(_props: Record<string, any>) {
-  return <div data-testid="film-wizard" />;
+import { useState, useMemo } from "react";
+import type { Theme } from "../hooks/use-theme";
+import type { TFunction } from "../hooks/use-i18n";
+import type { SSEMessage } from "../hooks/use-sse";
+import { useColors } from "../hooks/use-colors";
+import { useApi } from "../hooks/use-api";
+import {
+  WIZARD_PHASES,
+  computePhaseProgress,
+  computeStaleFlags,
+} from "../lib/film-wizard-progress";
+import type { Phase, PhaseStatus } from "../lib/film-wizard-progress";
+import type { StoryGraph } from "@actalk/inkos-core/interactive-film/graph-schema";
+import { ChatPage } from "./ChatPage";
+import { StoryGraphTree } from "./StoryGraphTree";
+import { StoryPlayer } from "./StoryPlayer";
+import FlowView from "./FlowView";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface ValidationReport {
+  ok: boolean;
+  issues: {
+    code: string;
+    level: "error" | "warning" | "info";
+    message: string;
+    nodeIds: string[];
+  }[];
+}
+
+// Superset of all sub-component Nav interfaces.
+interface Nav {
+  toDashboard: () => void;
+  toPlay: (id: string) => void;
+  toFlow: (id: string) => void;
+  toFilmAuthor: (id: string) => void;
+  toFilm: (projectId: string) => void;
+  toFilmStudio: (projectId: string) => void;
+  toBook: (id: string) => void;
+  toServices: () => void;
+  toImport: (tab?: "chapters" | "canon" | "fanfic" | "spinoff" | "imitation") => void;
+  toStyle: () => void;
+}
+
+interface FilmWizardProps {
+  projectId: string;
+  nav: Nav;
+  theme: Theme;
+  t: TFunction;
+  sse: { messages: ReadonlyArray<SSEMessage>; connected: boolean };
+}
+
+type Colors = ReturnType<typeof useColors>;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const PHASE_LABELS: Record<Phase, string> = {
+  world: "世界",
+  scale: "规模",
+  structure: "结构",
+  workshop: "车间",
+  validate: "校验",
+};
+
+const STATUS_BADGE: Record<PhaseStatus, string> = {
+  empty: "○",
+  partial: "◐",
+  done: "●",
+};
+
+const DEFAULT_SUBVIEW: Record<Phase, string> = {
+  world: "chat",
+  scale: "scale",
+  structure: "flow",
+  workshop: "tree",
+  validate: "validate",
+};
+
+const PHASE_SUBVIEWS: Record<Phase, ReadonlyArray<{ key: string; label: string }>> = {
+  world: [
+    { key: "chat", label: "对话" },
+    { key: "anchor", label: "世界锚点" },
+  ],
+  scale: [],
+  structure: [
+    { key: "flow", label: "流程图" },
+    { key: "tree", label: "树" },
+  ],
+  workshop: [
+    { key: "tree", label: "树" },
+    { key: "chat", label: "对话" },
+  ],
+  validate: [],
+};
+
+const EMPTY_PROGRESS: Record<Phase, PhaseStatus> = {
+  world: "empty",
+  scale: "empty",
+  structure: "empty",
+  workshop: "empty",
+  validate: "empty",
+};
+
+const EMPTY_STALE: Record<Phase, boolean> = {
+  world: false,
+  scale: false,
+  structure: false,
+  workshop: false,
+  validate: false,
+};
+
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
+function WorldAnchorView({
+  graph,
+  c,
+}: {
+  graph: StoryGraph | null;
+  c: Colors;
+}) {
+  if (!graph?.worldAnchor) {
+    return (
+      <div className={`p-6 text-sm ${c.muted}`}>
+        暂无世界锚点。请先切换到「对话」，请 AI 帮您设定世界观和角色。
+      </div>
+    );
+  }
+
+  const { worldAnchor } = graph;
+  return (
+    <div className="p-4 space-y-3 text-sm" data-testid="film-world">
+      <div>
+        <div className={`text-xs font-medium mb-1 ${c.muted}`}>故事核心</div>
+        <div className="text-foreground">{worldAnchor.storyCore || "—"}</div>
+      </div>
+      <div className="flex gap-6">
+        <div>
+          <div className={`text-xs font-medium mb-1 ${c.muted}`}>主题</div>
+          <div>{worldAnchor.theme || "—"}</div>
+        </div>
+        <div>
+          <div className={`text-xs font-medium mb-1 ${c.muted}`}>题材</div>
+          <div>{worldAnchor.genre || "—"}</div>
+        </div>
+        {worldAnchor.durationMinutes > 0 && (
+          <div>
+            <div className={`text-xs font-medium mb-1 ${c.muted}`}>时长</div>
+            <div>{worldAnchor.durationMinutes} 分钟</div>
+          </div>
+        )}
+      </div>
+      {worldAnchor.worldRules && (
+        <div>
+          <div className={`text-xs font-medium mb-1 ${c.muted}`}>世界规则</div>
+          <div className="whitespace-pre-wrap">{worldAnchor.worldRules}</div>
+        </div>
+      )}
+      {graph.characters.length > 0 && (
+        <div>
+          <div className={`text-xs font-medium mb-2 ${c.muted}`}>主要角色</div>
+          <ul className="space-y-2">
+            {graph.characters.map((ch) => (
+              <li key={ch.id} className="flex items-start gap-2">
+                <span className={`shrink-0 text-xs px-1.5 py-0.5 rounded border border-border ${c.muted}`}>
+                  {ch.role}
+                </span>
+                <span>
+                  <span className="font-medium text-foreground">{ch.name}</span>
+                  {ch.motivation && (
+                    <span className={` ml-2 ${c.muted}`}>{ch.motivation}</span>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScalePlaceholderView({ c }: { c: Colors }) {
+  return (
+    <div className={`p-6 text-sm ${c.muted}`} data-testid="film-scale-placeholder">
+      规模配置（P2 功能）— 在此设定节点数量目标、分支深度、多结局数量等参数。
+    </div>
+  );
+}
+
+function ValidateView({
+  validation,
+  c,
+}: {
+  validation: ValidationReport | null;
+  c: Colors;
+}) {
+  if (!validation) {
+    return <div className={`p-4 text-sm ${c.muted}`}>正在请求校验结果…</div>;
+  }
+
+  return (
+    <div className="p-4 max-w-2xl">
+      <div className="border rounded p-3" data-testid="validation-panel">
+        <div className={`text-sm font-medium ${c.muted}`}>
+          校验{validation.ok ? "" : "（有阻断问题）"}
+        </div>
+        {validation.issues.length === 0 ? (
+          <div className={`text-sm mt-1 ${c.muted}`}>无问题</div>
+        ) : (
+          <ul className="mt-1 space-y-1">
+            {validation.issues.map((issue, i) => (
+              <li
+                key={i}
+                data-testid={`validation-issue-${issue.code}`}
+                className="text-xs flex gap-2"
+              >
+                <span
+                  className={
+                    issue.level === "error"
+                      ? "text-red-500"
+                      : issue.level === "warning"
+                      ? "text-amber-500"
+                      : "text-slate-400"
+                  }
+                >
+                  [{issue.level}]
+                </span>
+                <span>{issue.message}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main wizard component
+// ---------------------------------------------------------------------------
+
+export default function FilmWizard({
+  projectId,
+  nav,
+  theme,
+  t,
+  sse,
+}: FilmWizardProps) {
+  const c = useColors(theme);
+  const [phase, setPhase] = useState<Phase>("world");
+  const [subViews, setSubViews] = useState<Record<Phase, string>>({ ...DEFAULT_SUBVIEW });
+  const [showPreview, setShowPreview] = useState(false);
+
+  const { data: graph } = useApi<StoryGraph>(`/projects/${projectId}/story-graph`);
+  const { data: validation } = useApi<ValidationReport>(
+    `/projects/${projectId}/story-graph/validation`,
+  );
+
+  const progress = useMemo<Record<Phase, PhaseStatus>>(
+    () => (graph ? computePhaseProgress(graph) : EMPTY_PROGRESS),
+    [graph],
+  );
+
+  const stale = useMemo<Record<Phase, boolean>>(
+    () => (graph ? computeStaleFlags(graph, undefined, 0) : EMPTY_STALE),
+    [graph],
+  );
+
+  const currentSubView = subViews[phase];
+  const subviews = PHASE_SUBVIEWS[phase];
+
+  function handlePhaseClick(p: Phase) {
+    setShowPreview(false);
+    setPhase(p);
+  }
+
+  function handleSubViewClick(key: string) {
+    setSubViews({ ...subViews, [phase]: key });
+  }
+
+  function handlePreviewToggle() {
+    setShowPreview((v) => !v);
+  }
+
+  return (
+    <div data-testid="film-wizard" className="flex flex-col h-screen bg-background text-foreground">
+
+      {/* ── Phase stepper top bar ── */}
+      <div className="flex items-center justify-between border-b border-border px-4 py-2 shrink-0 gap-3">
+        <div className="flex items-center gap-1 flex-wrap">
+          {WIZARD_PHASES.map((p) => {
+            const isActive = phase === p && !showPreview;
+            const badge = STATUS_BADGE[progress[p]];
+            return (
+              <button
+                key={p}
+                type="button"
+                data-testid={`wizard-step-${p}`}
+                onClick={() => handlePhaseClick(p)}
+                className={[
+                  "relative flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-all",
+                  isActive ? c.btnPrimary : c.btnSecondary,
+                ].join(" ")}
+              >
+                {stale[p] && (
+                  <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-destructive" />
+                )}
+                <span className="tabular-nums">{badge}</span>
+                <span>{PHASE_LABELS[p]}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        <button
+          type="button"
+          data-testid="wizard-preview"
+          onClick={handlePreviewToggle}
+          className={[
+            "shrink-0 flex items-center gap-1 rounded-md px-3 py-1.5 text-sm font-medium",
+            showPreview ? c.btnPrimary : c.btnSecondary,
+          ].join(" ")}
+        >
+          试玩
+        </button>
+      </div>
+
+      {/* ── Sub-view switch bar ── */}
+      {!showPreview && subviews.length > 0 && (
+        <div className="flex items-center gap-1 border-b border-border px-4 py-1.5 shrink-0">
+          {subviews.map((sv) => (
+            <button
+              key={sv.key}
+              type="button"
+              data-testid={`wizard-subview-${sv.key}`}
+              onClick={() => handleSubViewClick(sv.key)}
+              className={[
+                "rounded px-3 py-1 text-sm font-medium transition-colors",
+                currentSubView === sv.key ? c.btnPrimary : c.btnSecondary,
+              ].join(" ")}
+            >
+              {sv.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* ── Main content area ── */}
+      <div className="flex-1 min-h-0 overflow-auto">
+        <MainArea
+          showPreview={showPreview}
+          phase={phase}
+          subView={currentSubView}
+          projectId={projectId}
+          nav={nav}
+          theme={theme}
+          t={t}
+          sse={sse}
+          graph={graph}
+          validation={validation}
+          c={c}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main area switcher (extracted to keep FilmWizard clean)
+// ---------------------------------------------------------------------------
+
+interface MainAreaProps {
+  showPreview: boolean;
+  phase: Phase;
+  subView: string;
+  projectId: string;
+  nav: Nav;
+  theme: Theme;
+  t: TFunction;
+  sse: { messages: ReadonlyArray<SSEMessage>; connected: boolean };
+  graph: StoryGraph | null;
+  validation: ValidationReport | null;
+  c: Colors;
+}
+
+function MainArea({
+  showPreview,
+  phase,
+  subView,
+  projectId,
+  nav,
+  theme,
+  t,
+  sse,
+  graph,
+  validation,
+  c,
+}: MainAreaProps) {
+  if (showPreview) {
+    return <StoryPlayer projectId={projectId} nav={nav} theme={theme} t={t} />;
+  }
+
+  if (phase === "world" && subView === "chat") {
+    return (
+      <div className="h-[calc(100vh-180px)] relative overflow-hidden">
+        <ChatPage
+          activeBookId={projectId}
+          mode="interactive-film-authoring"
+          nav={nav}
+          theme={theme}
+          t={t}
+          sse={sse}
+        />
+      </div>
+    );
+  }
+
+  if (phase === "world" && subView === "anchor") {
+    return <WorldAnchorView graph={graph} c={c} />;
+  }
+
+  if (phase === "scale") {
+    return <ScalePlaceholderView c={c} />;
+  }
+
+  if (phase === "structure" && subView === "flow") {
+    return <FlowView projectId={projectId} nav={nav} theme={theme} t={t} />;
+  }
+
+  if (
+    (phase === "structure" && subView === "tree") ||
+    (phase === "workshop" && subView === "tree")
+  ) {
+    return <StoryGraphTree projectId={projectId} nav={nav} theme={theme} t={t} />;
+  }
+
+  if (phase === "workshop" && subView === "chat") {
+    return (
+      <div className="h-[calc(100vh-180px)] relative overflow-hidden">
+        <ChatPage
+          activeBookId={projectId}
+          mode="interactive-film-authoring"
+          nav={nav}
+          theme={theme}
+          t={t}
+          sse={sse}
+        />
+      </div>
+    );
+  }
+
+  if (phase === "validate") {
+    return <ValidateView validation={validation} c={c} />;
+  }
+
+  return null;
 }
