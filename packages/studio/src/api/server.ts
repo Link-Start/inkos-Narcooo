@@ -75,6 +75,7 @@ import {
   listBuiltinPrompts,
   loadPromptPackPrompt,
   promptOverridePath,
+  toPosixPath,
   type ActionPayload,
   type ActionSource,
   type BuiltinPrompt,
@@ -722,7 +723,8 @@ async function toStudioPromptPackPrompt(root: string, prompt: BuiltinPrompt) {
     content: loaded.content,
     source: loaded.source,
     overridden: loaded.source === "project",
-    path: loaded.source === "project" ? relative(root, overridePath) : undefined,
+    // Windows 上 relative() 产生反斜杠，这个 path 会被前端展示/断言为 posix 相对路径
+    path: loaded.source === "project" ? toPosixPath(relative(root, overridePath)) : undefined,
   };
 }
 
