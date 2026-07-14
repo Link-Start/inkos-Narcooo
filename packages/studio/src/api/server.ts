@@ -2499,6 +2499,35 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     await saveStudioTaskSnapshot(root, snapshot);
   };
 
+  const loadReconciledTaskSnapshot = async (sessionId: string): Promise<StudioTaskSnapshot | null> => {
+    const task = await loadStudioTaskSnapshot(root, sessionId);
+    if (!task) return null;
+    const running = task.execution.status === "running" || task.execution.status === "processing";
+    if (!running || activeConfirmedTasks.has(task.execution.id)) return task;
+    // running 快照但本进程没有对应的 AbortController，只可能是任务运行期间
+    // server 进程退出过（正常流程里 controller 先于首次持久化进入 Map、晚于
+    // 终态持久化删除）。任务本体已随旧进程消失，这里把快照改写为终态并保存，
+    // 否则前端每次刷新都会恢复出一个永远运行中的任务卡，停止按钮也无法终结它。
+    const lang = await currentProjectLanguage();
+    const completedAt = Date.now();
+    const reconciled: StudioTaskSnapshot = {
+      ...task,
+      updatedAt: completedAt,
+      execution: {
+        ...task.execution,
+        status: "error",
+        error: pick(
+          lang,
+          "任务已中断：Studio 服务在任务运行期间重启，任务未能继续。请重新发起。",
+          "Task interrupted: the Studio server restarted while this task was running. Please start it again.",
+        ),
+        completedAt,
+      },
+    };
+    await saveStudioTaskSnapshot(root, reconciled);
+    return reconciled;
+  };
+
   app.use("/*", cors());
 
   // Structured error handler — ApiError returns typed JSON, others return 500
@@ -3109,7 +3138,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       await stream.writeSSE({ event: "ping", data: "" });
       const sessionId = c.req.query("sessionId");
       if (sessionId) {
-        const task = await loadStudioTaskSnapshot(root, sessionId);
+        const task = await loadReconciledTaskSnapshot(sessionId);
         if (task) await stream.writeSSE({ event: "task:snapshot", data: JSON.stringify(task) });
       }
 
@@ -4116,7 +4145,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const sessionId = c.req.param("sessionId");
     const session = await loadBookSession(root, sessionId);
     if (!session) return c.json({ error: "Session not found" }, 404);
-    const task = await loadStudioTaskSnapshot(root, sessionId);
+    const task = await loadReconciledTaskSnapshot(sessionId);
     return c.json({ session, ...(task ? { task } : {}) });
   });
 
@@ -4185,7 +4214,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   app.post("/api/v1/sessions/:sessionId/abort", async (c) => {
     const sessionId = c.req.param("sessionId");
-    const task = await loadStudioTaskSnapshot(root, sessionId);
+    const task = await loadReconciledTaskSnapshot(sessionId);
     const controller = task ? activeConfirmedTasks.get(task.execution.id) : undefined;
     controller?.abort();
     const aborted = abortAgentSession(root, sessionId) || Boolean(controller);

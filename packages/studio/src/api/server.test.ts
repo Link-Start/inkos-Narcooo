@@ -3015,14 +3015,71 @@ describe("createStudioServer daemon lifecycle", () => {
     });
   });
 
-  it("returns the persisted task snapshot with session detail after a refresh", async () => {
+  it("returns the persisted task snapshot with session detail while the task is still running", async () => {
+    let resolveInitBook!: () => void;
+    initBookMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveInitBook = resolve;
+    }));
+    loadBookSessionMock.mockResolvedValue({
+      sessionId: "refresh-task-session",
+      bookId: null,
+      sessionKind: "book-create",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingResponse = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "创建《雨夜账本》。",
+        sessionId: "refresh-task-session",
+        sessionKind: "book-create",
+        actionSource: "button",
+        requestedIntent: "create_book",
+        actionPayload: { createBook: { title: "雨夜账本", language: "zh" } },
+      }),
+    });
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "refresh-task-session");
+      expect(task?.execution.status).toBe("running");
+    });
+
+    const response = await app.request("http://localhost/api/v1/sessions/refresh-task-session");
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      session: { sessionId: "refresh-task-session" },
+      task: {
+        sessionId: "refresh-task-session",
+        execution: {
+          tool: "sub_agent",
+          agent: "architect",
+          status: "running",
+        },
+      },
+    });
+
+    resolveInitBook();
+    await pendingResponse;
+  });
+
+  it("rewrites a stale running task snapshot to error when the server has no live task for it", async () => {
+    // 直接写入 running 快照后新建 server 实例，等价于任务运行期间 server 进程重启：
+    // 快照必须被改写为终态，否则前端每次刷新都会恢复出一个永远运行中的任务卡。
     await saveStudioTaskSnapshot(root, {
       version: 1,
-      sessionId: "agent-session-1",
+      sessionId: "stale-task-session",
       requestedIntent: "short_run",
       updatedAt: 20,
       execution: {
-        id: "short-task-1",
+        id: "stale-task-1",
         tool: "short_fiction_run",
         label: "生成短篇",
         status: "running",
@@ -3033,19 +3090,22 @@ describe("createStudioServer daemon lifecycle", () => {
     const { createStudioServer } = await import("./server.js");
     const app = createStudioServer(cloneProjectConfig() as never, root);
 
-    const response = await app.request("http://localhost/api/v1/sessions/agent-session-1");
+    const response = await app.request("http://localhost/api/v1/sessions/stale-task-session");
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      session: { sessionId: "agent-session-1" },
       task: {
-        sessionId: "agent-session-1",
+        sessionId: "stale-task-session",
         execution: {
-          id: "short-task-1",
-          status: "running",
-          logs: ["正在生成大纲"],
+          id: "stale-task-1",
+          status: "error",
+          error: expect.any(String),
+          completedAt: expect.any(Number),
         },
       },
+    });
+    await expect(loadStudioTaskSnapshot(root, "stale-task-session")).resolves.toMatchObject({
+      execution: { id: "stale-task-1", status: "error" },
     });
   });
 
