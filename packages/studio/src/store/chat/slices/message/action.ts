@@ -11,6 +11,7 @@ import type {
 } from "../../types";
 import { fetchJson } from "../../../../hooks/use-api";
 import { tr } from "../../../../lib/app-language";
+import { isConfirmedProductionSend } from "../../message-policy";
 import { attachSessionStreamListeners } from "./stream-events";
 import {
   bookKey,
@@ -18,6 +19,7 @@ import {
   deriveResolvedProposals,
   deserializeMessages,
   extractErrorMessage,
+  hasAnyInFlightExecution,
   markRunningToolsFailed,
   mergeTaskExecution,
   mergeSessionIds,
@@ -149,8 +151,16 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
             || execution.status === "processing"
             || execution.status === "error",
         );
+        // 只把本轮（streamTs 消息）里的运行中工具标记为失败：并行运行的后台
+        // 任务卡挂在更早的消息上，聊天轮出错不代表任务失败，不能连带标记。
+        // isStreaming / stream 的收尾统一交给 sendMessage 的 finally 判断
+        //（那里会检查是否还有任务在跑）。
         const messages = hasActiveOrFailedTool
-          ? markRunningToolsFailed(session.messages, errorMsg)
+          ? session.messages.map((message) => (
+              message.timestamp === streamTs && message.role === "assistant"
+                ? markRunningToolsFailed([message], errorMsg)[0]!
+                : message
+            ))
           : [
               ...session.messages.filter(
                 (message) => !(message.timestamp === streamTs && message.role === "assistant"),
@@ -159,9 +169,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
             ];
         return {
           messages,
-          isStreaming: false,
           lastError: errorMsg,
-          stream: null,
         };
       }),
     })),
@@ -331,21 +339,42 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
     });
   },
 
-  abortSession: async (sessionId) => {
+  abortSession: async (sessionId, scope = "all") => {
     const session = get().sessions[sessionId];
-    session?.stream?.close();
-    const stoppedAt = Date.now();
-    const stoppedMessage = tr("已由用户停止", "Stopped by user");
-    set((state) => ({
-      sessions: updateSession(state.sessions, sessionId, (runtime) => ({
-        isStreaming: false,
-        stream: null,
-        lastError: null,
-        messages: markRunningToolsFailed(runtime.messages, stoppedMessage, stoppedAt),
-      })),
-    }));
+    if (scope === "all") {
+      session?.stream?.close();
+      const stoppedAt = Date.now();
+      const stoppedMessage = tr("已由用户停止", "Stopped by user");
+      set((state) => ({
+        sessions: updateSession(state.sessions, sessionId, (runtime) => ({
+          isStreaming: false,
+          isChatStreaming: false,
+          stream: null,
+          lastError: null,
+          messages: markRunningToolsFailed(runtime.messages, stoppedMessage, stoppedAt),
+        })),
+      }));
+    } else {
+      // scope=chat：只停当前聊天轮，后台任务还在跑。
+      // 不关连接（任务事件还要继续到达）、不把任务卡标记为失败；
+      // 聊天轮自身的收尾由 sendMessage 的 finally 完成。
+      set((state) => ({
+        sessions: updateSession(state.sessions, sessionId, () => ({
+          isChatStreaming: false,
+          lastError: null,
+        })),
+      }));
+    }
     try {
-      await fetchJson(`/sessions/${sessionId}/abort`, { method: "POST" });
+      await fetchJson(`/sessions/${sessionId}/abort`, {
+        method: "POST",
+        ...(scope === "chat"
+          ? {
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ scope: "chat" }),
+            }
+          : {}),
+      });
     } catch (error) {
       get().addErrorMessage(sessionId, error instanceof Error ? error.message : String(error));
     }
@@ -432,7 +461,9 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
     const trimmed = text.trim();
     const attachments = options?.attachments ?? [];
     const session = get().sessions[sessionId];
-    if ((!trimmed && attachments.length === 0) || !session || session.isStreaming) return;
+    // 只挡"聊天轮流式中"：后台生产任务运行期间（isStreaming=true 但
+    // isChatStreaming=false）允许继续发消息，聊天与任务并行。
+    if ((!trimmed && attachments.length === 0) || !session || session.isChatStreaming) return;
     const userInstruction = trimmed || tr("请阅读我上传的文件。", "Please read the files I uploaded.");
     const activeBookId = options?.activeBookId ?? session.bookId ?? undefined;
     const sessionKind: ChatSessionKind = options?.sessionKind
@@ -480,17 +511,24 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
     const requestedSkills = mergeSkillIds(skillDirectives.requestedSkills, options?.requestedSkills);
     const disabledSkills = mergeSkillIds([], options?.disabledSkills);
     const streamTs = Date.now() + 1;
+    // 确认式生产任务的发送轮不是"聊天轮"：请求会挂起到任务结束，
+    // 期间用户仍可继续聊天，所以不置 isChatStreaming。
+    const isProductionTaskSend = isConfirmedProductionSend(actionSource, options?.requestedIntent);
 
     set((state) => ({
       input: "",
       activeSessionId: sessionId,
       sessions: updateSession(state.sessions, sessionId, () => ({
         isStreaming: true,
+        isChatStreaming: !isProductionTaskSend,
         lastError: null,
       })),
     }));
 
     get().addUserMessage(sessionId, formatUserMessageForDisplay(userInstruction, attachments));
+    // 单连接原则：任务恢复流等旧连接先关掉，换成本轮的新连接。
+    // 运行中的任务卡不受影响——新连接建立时服务端会重放 running 快照，
+    // 任务日志（log）与收尾（tool:end）都按 execution id 匹配，与 streamTs 无关。
     session.stream?.close();
     const streamEs = new EventSource(`/api/v1/events?sessionId=${encodeURIComponent(sessionId)}`);
     set((state) => ({
@@ -518,8 +556,6 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
           service: get().selectedService ?? undefined,
         }),
       });
-
-      streamEs.close();
 
       const finalContent = data.details?.draftRaw || data.response || "";
       const toolCall = data.details?.toolCall ?? undefined;
@@ -620,7 +656,6 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
         }
       }
     } catch (error) {
-      streamEs.close();
       const errorMessage = error instanceof Error ? error.message : String(error);
       const failureAlreadyShown = get().sessions[sessionId]?.messages.some((message) => {
         const executions = [
@@ -644,12 +679,23 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
         get().addErrorMessage(sessionId, errorMessage);
       }
     } finally {
-      set((state) => ({
-        sessions: updateSession(state.sessions, sessionId, (runtime) => ({
-          isStreaming: false,
-          stream: runtime.stream === streamEs ? null : runtime.stream,
-        })),
-      }));
+      // 本轮请求已结束（成功/出错都走这里）。只有当会话的连接仍归本轮所有时
+      // 才收尾：如果发新消息时旧连接已被替换（stream 指向更新一轮的连接），
+      // 由新一轮负责后续状态。
+      const runtime = get().sessions[sessionId];
+      if (runtime && (runtime.stream === streamEs || runtime.stream === null)) {
+        // 还有生产任务在跑：保持连接与 isStreaming，等任务自己的终态事件
+        //（tool:end → agent:complete）到来时由 stream-events 收尾。
+        const taskInFlight = hasAnyInFlightExecution(runtime.messages);
+        if (!taskInFlight) streamEs.close();
+        set((state) => ({
+          sessions: updateSession(state.sessions, sessionId, () => ({
+            isChatStreaming: false,
+            isStreaming: taskInFlight,
+            stream: taskInFlight ? streamEs : null,
+          })),
+        }));
+      }
     }
   },
 });

@@ -200,6 +200,7 @@ export function createSessionRuntime(input: {
     messages: input.messages ?? [],
     stream: null,
     isStreaming: false,
+    isChatStreaming: false,
     lastError: null,
     isDraft: input.isDraft ?? false,
   };
@@ -282,6 +283,47 @@ export function hasInFlightExecution(
     (message.toolExecutions?.some(inFlight) ?? false)
     || (message.parts?.some((part) => part.type === "tool" && inFlight(part.execution)) ?? false),
   );
+}
+
+/**
+ * 消息里是否还有任何 running/processing 的工具执行。
+ * 聊天轮结束时用它判断"后台生产任务是否还在跑"：只有全部执行都到终态，
+ * 才允许关闭 SSE 连接并把 isStreaming 置回 false。
+ */
+export function hasAnyInFlightExecution(messages: ReadonlyArray<Message>): boolean {
+  const inFlight = (execution: ToolExecution): boolean =>
+    execution.status === "running" || execution.status === "processing";
+
+  return messages.some((message) =>
+    (message.toolExecutions?.some(inFlight) ?? false)
+    || (message.parts?.some((part) => part.type === "tool" && inFlight(part.execution)) ?? false),
+  );
+}
+
+/**
+ * 按 execution id 在全部消息里定位工具卡并更新（并行聊天时任务卡挂在更早的
+ * 任务轮消息上，不能只在当前 streamTs 的消息里找）。找不到时返回 null。
+ */
+export function updateToolPartById(
+  messages: ReadonlyArray<Message>,
+  executionId: string,
+  update: (execution: ToolExecution) => ToolExecution,
+): ReadonlyArray<Message> | null {
+  let found = false;
+  const next = messages.map((message) => {
+    const hasPart = message.parts?.some(
+      (part) => part.type === "tool" && part.execution.id === executionId,
+    ) ?? false;
+    if (!hasPart) return message;
+    found = true;
+    const parts = (message.parts ?? []).map((part) => (
+      part.type === "tool" && part.execution.id === executionId
+        ? { type: "tool" as const, execution: update(part.execution) }
+        : part
+    ));
+    return { ...message, ...deriveFlat(parts), parts };
+  });
+  return found ? next : null;
 }
 
 export function markRunningToolsFailed(

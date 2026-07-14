@@ -155,7 +155,11 @@ export interface SessionRuntime {
   readonly title: string | null;
   readonly messages: ReadonlyArray<Message>;
   readonly stream: EventSource | null;
+  // isStreaming = 聊天轮流式中 或 后台生产任务运行中（面向"会话是否忙"的读取方）。
   readonly isStreaming: boolean;
+  // isChatStreaming 只表示聊天轮本身在流式中；后台任务运行期间它是 false，
+  // 用户仍可继续发消息。
+  readonly isChatStreaming: boolean;
   readonly lastError: string | null;
   // 仅前端存在、尚未持久化到磁盘的草稿会话。发送第一条消息时才调 POST /sessions 把它落盘。
   readonly isDraft: boolean;
@@ -204,7 +208,8 @@ export interface MessageActions {
   deleteSession: (sessionId: string) => Promise<void>;
   loadSessionDetail: (sessionId: string) => Promise<void>;
   sendMessage: (sessionId: string, text: string, options?: SendMessageOptions) => Promise<void>;
-  abortSession: (sessionId: string) => Promise<void>;
+  // scope="chat" 只中止当前聊天轮，不停后台生产任务；默认 "all" 两者一起停。
+  abortSession: (sessionId: string, scope?: "chat" | "all") => Promise<void>;
   setSelectedModel: (model: string, service: string) => void;
 }
 

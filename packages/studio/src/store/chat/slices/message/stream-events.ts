@@ -1,5 +1,5 @@
 import type { StateCreator } from "zustand";
-import type { ChatStore, MessageActions, MessagePart, PipelineStage, ToolExecution } from "../../types";
+import type { ChatStore, Message, MessageActions, MessagePart, PipelineStage, ToolExecution } from "../../types";
 import { shouldRefreshSidebarForTool } from "../../message-policy";
 import { tr } from "../../../../lib/app-language";
 import {
@@ -8,6 +8,7 @@ import {
   extractToolError,
   findRunningToolPart,
   getOrCreateStream,
+  hasAnyInFlightExecution,
   hasInFlightExecution,
   mergeTaskExecution,
   replaceLast,
@@ -15,6 +16,7 @@ import {
   sessionMatchesEvent,
   summarizeResult,
   updateSession,
+  updateToolPartById,
 } from "./runtime";
 
 type SliceSet = Parameters<StateCreator<ChatStore, [], [], MessageActions>>[0];
@@ -94,6 +96,35 @@ export function appendBoundedToolLogs(
   incoming: ReadonlyArray<string>,
 ): string[] {
   return [...(existing ?? []), ...incoming].slice(-MAX_TOOL_LOGS);
+}
+
+/**
+ * 倒序扫描消息，找到最近一个仍在运行的工具卡并更新它。
+ * 任务与聊天并行时，任务卡挂在更早的任务轮消息上，不能只看当前 streamTs
+ * 的消息。update 返回 null 表示这张卡不需要更新（整体视为 no-op）。
+ */
+export function updateLatestRunningToolMessage(
+  messages: ReadonlyArray<Message>,
+  update: (execution: ToolExecution) => ToolExecution | null,
+): ReadonlyArray<Message> | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]!;
+    const running = findRunningToolPart([...(message.parts ?? [])]);
+    if (!running) continue;
+    const updated = update(running.execution);
+    if (!updated) return null;
+    const parts = (message.parts ?? []).map((part) => (
+      part.type === "tool" && part.execution.id === running.execution.id
+        ? { type: "tool" as const, execution: updated }
+        : part
+    ));
+    return [
+      ...messages.slice(0, i),
+      { ...message, ...deriveFlat(parts), parts },
+      ...messages.slice(i + 1),
+    ];
+  }
+  return null;
 }
 
 export function createStreamTextDeltaBatcher(
@@ -210,33 +241,26 @@ export function attachSessionStreamListeners({
   const progressThrottle = createLatestEventThrottle<StreamProgressEventData>((data) => {
     set((state) => ({
       sessions: updateSession(state.sessions, sessionId, (runtime) => {
-        const [messages, stream] = getOrCreateStream(runtime.messages, streamTs);
-        const runningTool = findRunningToolPart([...(stream.parts ?? [])]);
-        if (!runningTool?.execution.stages) return {};
-        const parts = (stream.parts ?? []).map((part) => {
-          if (part.type !== "tool" || part.execution.id !== runningTool.execution.id) return part;
+        const messages = updateLatestRunningToolMessage(runtime.messages, (execution) => {
+          if (!execution.stages) return null;
           return {
-            type: "tool" as const,
-            execution: {
-              ...part.execution,
-              stages: part.execution.stages?.map((stage) =>
-                stage.status === "active"
-                  ? {
-                      ...stage,
-                      progress: {
-                        status: data.status,
-                        elapsedMs: data.elapsedMs,
-                        totalChars: data.totalChars,
-                        chineseChars: data.chineseChars,
-                      },
-                    }
-                  : stage,
-              ),
-            },
+            ...execution,
+            stages: execution.stages.map((stage) =>
+              stage.status === "active"
+                ? {
+                    ...stage,
+                    progress: {
+                      status: data.status,
+                      elapsedMs: data.elapsedMs,
+                      totalChars: data.totalChars,
+                      chineseChars: data.chineseChars,
+                    },
+                  }
+                : stage,
+            ),
           };
         });
-        const flat = deriveFlat(parts);
-        return { messages: replaceLast(messages, { ...stream, ...flat, parts }) };
+        return messages ? { messages } : {};
       }),
     }));
   });
@@ -244,12 +268,22 @@ export function attachSessionStreamListeners({
   streamEs.addEventListener("draft:complete", flushTextDeltas);
   streamEs.addEventListener("draft:error", flushTextDeltas);
 
+  // agent:complete / agent:error / agent:aborted 都是"某一轮请求结束"的信号，
+  // 但事件本身分不清结束的是聊天轮还是后台任务轮（两者共享 sessionId）：
+  // - 聊天轮还在进行（isChatStreaming=true）时不能关连接——事件既可能属于
+  //   聊天轮自己（随后 sendMessage 的 finally 会收尾），也可能属于后台任务
+  //   （聊天要继续）；
+  // - 聊天轮已结束时，只要消息里还有 in-flight 的任务卡，连接也要保持，
+  //   等任务自己的终态事件（tool:end → agent:complete）到来再关闭。
   const finishSessionStream = (event: MessageEvent) => {
     try {
       const data = event.data ? JSON.parse(event.data) : null;
       if (!sessionMatchesEvent(sessionId, data)) return;
       flushTextDeltas();
       progressThrottle.flush();
+      const runtime = get().sessions[sessionId];
+      if (!runtime || runtime.isChatStreaming) return;
+      if (hasAnyInFlightExecution(runtime.messages)) return;
       streamEs.close();
       set((state) => ({
         sessions: updateSession(state.sessions, sessionId, () => ({
@@ -290,23 +324,7 @@ export function attachSessionStreamListeners({
     }
   });
 
-  streamEs.addEventListener("agent:aborted", (event: MessageEvent) => {
-    try {
-      const data = event.data ? JSON.parse(event.data) : null;
-      if (!sessionMatchesEvent(sessionId, data)) return;
-      flushTextDeltas();
-      progressThrottle.flush();
-      streamEs.close();
-      set((state) => ({
-        sessions: updateSession(state.sessions, sessionId, () => ({
-          isStreaming: false,
-          stream: null,
-        })),
-      }));
-    } catch {
-      // ignore
-    }
-  });
+  streamEs.addEventListener("agent:aborted", finishSessionStream);
 
   streamEs.addEventListener("thinking:start", (event: MessageEvent) => {
     try {
@@ -430,10 +448,9 @@ export function attachSessionStreamListeners({
       progressThrottle.flush();
       set((state) => ({
         sessions: updateSession(state.sessions, sessionId, (runtime) => {
-          const [messages, stream] = getOrCreateStream(runtime.messages, streamTs);
-          const parts = (stream.parts ?? []).map((part) => {
-            if (part.type !== "tool" || part.execution.id !== data.id) return part;
-            const execution = { ...part.execution };
+          // 按 execution id 全量定位：并行聊天时任务卡在更早的消息里
+          const messages = updateToolPartById(runtime.messages, data.id as string, (previous) => {
+            const execution = { ...previous };
             execution.status = data.isError ? "error" : "completed";
             execution.completedAt = Date.now();
             execution.stages = execution.stages?.map((stage) =>
@@ -445,10 +462,9 @@ export function attachSessionStreamListeners({
             else execution.result = summarizeResult(data.result);
             const details = data.details ?? extractToolDetails(data.result);
             if (details !== undefined) execution.details = details;
-            return { type: "tool" as const, execution };
+            return execution;
           });
-          const flat = deriveFlat(parts);
-          return { messages: replaceLast(messages, { ...stream, ...flat, parts }) };
+          return messages ? { messages } : {};
         }),
       }));
 
@@ -469,18 +485,11 @@ export function attachSessionStreamListeners({
       flushTextDeltas();
       set((state) => ({
         sessions: updateSession(state.sessions, sessionId, (runtime) => {
-          const [messages, stream] = getOrCreateStream(runtime.messages, streamTs);
-          const runningTool = findRunningToolPart([...(stream.parts ?? [])]);
-          if (!runningTool) return {};
-          const parts = (stream.parts ?? []).map((part) => {
-            if (part.type !== "tool" || part.execution.id !== runningTool.execution.id) return part;
-            return {
-              type: "tool" as const,
-              execution: { ...part.execution, logs: appendBoundedToolLogs(part.execution.logs, [message]) },
-            };
-          });
-          const flat = deriveFlat(parts);
-          return { messages: replaceLast(messages, { ...stream, ...flat, parts }) };
+          const messages = updateLatestRunningToolMessage(runtime.messages, (execution) => ({
+            ...execution,
+            logs: appendBoundedToolLogs(execution.logs, [message]),
+          }));
+          return messages ? { messages } : {};
         }),
       }));
     } catch {

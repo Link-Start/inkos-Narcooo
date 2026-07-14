@@ -14,6 +14,7 @@ vi.mock("../../../../hooks/use-api", () => ({ fetchJson }));
 class FakeEventSource {
   readonly url: string;
   readonly listeners = new Map<string, Array<(event: MessageEvent) => void>>();
+  closed = false;
   constructor(url: string) {
     this.url = url;
     fakeEventSources.push(this);
@@ -23,7 +24,9 @@ class FakeEventSource {
     current.push(listener);
     this.listeners.set(type, current);
   }
-  close() {}
+  close() {
+    this.closed = true;
+  }
   emit(type: string, data: unknown) {
     for (const listener of this.listeners.get(type) ?? []) {
       listener({ data: JSON.stringify(data) } as MessageEvent);
@@ -432,5 +435,169 @@ describe("chat message actions", () => {
       expect.objectContaining({ content: expect.stringContaining("This operation was aborted") }),
     );
     now.mockRestore();
+  });
+
+  // 恢复出一个"任务运行中"的会话：磁盘上有 running 任务快照，前端加载详情后
+  // 会 merge 任务卡、建立 SSE 连接并把 isStreaming 置为 true。
+  async function setupRunningTaskSession(store: ReturnType<typeof createTestStore>): Promise<string> {
+    fetchJson.mockResolvedValueOnce({
+      session: { sessionId: "task-session-1", bookId: null, sessionKind: "short", title: "雨夜账本" },
+    });
+    const sessionId = await store.getState().createSession(null, "short");
+    store.getState().setSelectedModel("deepseek-v4-flash", "kkaiapi");
+    fetchJson.mockResolvedValueOnce({
+      session: { sessionId, bookId: null, sessionKind: "short", title: "雨夜账本", messages: [] },
+      task: {
+        version: 1,
+        sessionId,
+        requestedIntent: "short_run",
+        updatedAt: 20,
+        execution: {
+          id: "direct-short_run-1",
+          tool: "short_fiction_run",
+          label: "短篇生产",
+          status: "running",
+          startedAt: 10,
+        },
+      },
+    });
+    await store.getState().loadSessionDetail(sessionId);
+    expect(fakeEventSources).toHaveLength(1);
+    return sessionId;
+  }
+
+  function findTaskExecution(store: ReturnType<typeof createTestStore>, sessionId: string) {
+    return (store.getState().sessions[sessionId]?.messages ?? [])
+      .flatMap((message) => message.toolExecutions ?? [])
+      .find((execution) => execution.id === "direct-short_run-1");
+  }
+
+  it("sends a chat message while a production task is running without aborting the task", async () => {
+    const store = createTestStore();
+    const sessionId = await setupRunningTaskSession(store);
+
+    fetchJson.mockClear();
+    fetchJson.mockResolvedValueOnce({ response: "任务还在跑。", session: { sessionId, sessionKind: "short" } });
+
+    await store.getState().sendMessage(sessionId, "写得怎么样了？");
+
+    // 发送没有被挡、也没有调用 abort 接口
+    const calledPaths = fetchJson.mock.calls.map(([path]) => path);
+    expect(calledPaths).toContain("/agent");
+    expect(calledPaths).not.toContain(`/sessions/${sessionId}/abort`);
+    // 单连接原则：旧的任务恢复连接被换成新连接
+    expect(fakeEventSources).toHaveLength(2);
+    expect(fakeEventSources[0]?.closed).toBe(true);
+    expect(fakeEventSources[1]?.closed).toBe(false);
+    // 聊天轮结束后任务仍在跑：isStreaming 保持 true、连接保持、任务卡还在 running
+    expect(store.getState().sessions[sessionId]).toMatchObject({ isStreaming: true, isChatStreaming: false });
+    expect(store.getState().sessions[sessionId]?.stream).not.toBeNull();
+    expect(findTaskExecution(store, sessionId)).toMatchObject({ status: "running" });
+    // 聊天回复正常写入
+    expect(store.getState().sessions[sessionId]?.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "任务还在跑。",
+    });
+  });
+
+  it("keeps the task stream open when the chat round completes while the task is still running", async () => {
+    const store = createTestStore();
+    const sessionId = await setupRunningTaskSession(store);
+
+    let resolveAgent!: (value: unknown) => void;
+    fetchJson.mockClear();
+    fetchJson.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveAgent = resolve;
+    }));
+
+    const sent = store.getState().sendMessage(sessionId, "顺便聊两句");
+    await vi.waitFor(() => expect(fakeEventSources).toHaveLength(2));
+
+    // 聊天轮的 agent:complete 到达时任务仍在跑：不能把连接关掉
+    fakeEventSources[1]?.emit("agent:complete", { sessionId });
+    expect(fakeEventSources[1]?.closed).toBe(false);
+    expect(store.getState().sessions[sessionId]).toMatchObject({ isStreaming: true });
+
+    resolveAgent({ response: "聊完了。", session: { sessionId, sessionKind: "short" } });
+    await sent;
+
+    expect(fakeEventSources[1]?.closed).toBe(false);
+    expect(store.getState().sessions[sessionId]).toMatchObject({ isStreaming: true, isChatStreaming: false });
+
+    // 任务完成：tool:end 按 execution id 找到早前消息里的任务卡收尾，随后的 agent:complete 关闭连接
+    fakeEventSources[1]?.emit("tool:end", {
+      sessionId,
+      id: "direct-short_run-1",
+      tool: "short_fiction_run",
+      result: { content: [{ type: "text", text: "短篇已完成" }] },
+    });
+    fakeEventSources[1]?.emit("agent:complete", { sessionId });
+
+    expect(findTaskExecution(store, sessionId)).toMatchObject({ status: "completed" });
+    expect(fakeEventSources[1]?.closed).toBe(true);
+    expect(store.getState().sessions[sessionId]).toMatchObject({ isStreaming: false, stream: null });
+  });
+
+  it("closes the stream after a plain chat round when no production task is running", async () => {
+    const store = createTestStore();
+    const sessionId = store.getState().createDraftSession(null, "chat");
+    store.getState().setSelectedModel("deepseek-v4-flash", "kkaiapi");
+
+    let resolveAgent!: (value: unknown) => void;
+    fetchJson
+      .mockResolvedValueOnce({ session: { sessionId, bookId: null, sessionKind: "chat" } })
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveAgent = resolve;
+      }));
+
+    const sent = store.getState().sendMessage(sessionId, "你好");
+    await vi.waitFor(() => expect(fakeEventSources).toHaveLength(1));
+    expect(store.getState().sessions[sessionId]).toMatchObject({ isStreaming: true, isChatStreaming: true });
+
+    resolveAgent({ response: "你好！", session: { sessionId, sessionKind: "chat" } });
+    await sent;
+
+    expect(store.getState().sessions[sessionId]).toMatchObject({
+      isStreaming: false,
+      isChatStreaming: false,
+      stream: null,
+    });
+    expect(fakeEventSources[0]?.closed).toBe(true);
+  });
+
+  it("aborts only the chat round with scope=chat and keeps the running task card intact", async () => {
+    const store = createTestStore();
+    const sessionId = await setupRunningTaskSession(store);
+
+    let rejectAgent!: (error: Error) => void;
+    fetchJson.mockClear();
+    fetchJson
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => {
+        rejectAgent = reject;
+      }))
+      .mockResolvedValueOnce({ ok: true, aborted: true });
+
+    const sent = store.getState().sendMessage(sessionId, "顺便问一下");
+    await vi.waitFor(() => expect(fakeEventSources).toHaveLength(2));
+
+    await store.getState().abortSession(sessionId, "chat");
+
+    const abortCall = fetchJson.mock.calls.find(([path]) => path === `/sessions/${sessionId}/abort`);
+    expect(abortCall?.[1]).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({ scope: "chat" }),
+    });
+    // scope=chat 不把任务卡标记为失败，也不关任务连接
+    expect(findTaskExecution(store, sessionId)).toMatchObject({ status: "running" });
+    expect(fakeEventSources[1]?.closed).toBe(false);
+    expect(store.getState().sessions[sessionId]).toMatchObject({ isStreaming: true, isChatStreaming: false });
+
+    rejectAgent(new Error("This operation was aborted"));
+    await sent;
+
+    // 聊天轮收尾后任务照旧运行
+    expect(findTaskExecution(store, sessionId)).toMatchObject({ status: "running" });
+    expect(fakeEventSources[1]?.closed).toBe(false);
+    expect(store.getState().sessions[sessionId]).toMatchObject({ isStreaming: true });
   });
 });

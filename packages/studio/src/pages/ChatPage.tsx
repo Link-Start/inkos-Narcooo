@@ -414,6 +414,7 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const input = useChatStore((s) => s.input);
   const loading = useChatStore(chatSelectors.isActiveSessionStreaming);
+  const chatStreaming = useChatStore(chatSelectors.isActiveSessionChatStreaming);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const selectedService = useChatStore((s) => s.selectedService);
   // -- Store actions --
@@ -709,14 +710,19 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
     if (!activeSessionId) return;
     const hasPendingMessage = Boolean(text.trim()) || attachedFiles.length > 0;
     if (!hasPendingMessage) {
-      if (loading) await abortSession(activeSessionId);
+      // 停止按钮按对象分语义：聊天轮流式中只停聊天轮（后台任务继续跑）；
+      // 只有后台任务在跑时才停任务（旧行为）。
+      if (chatStreaming) await abortSession(activeSessionId, "chat");
+      else if (loading) await abortSession(activeSessionId);
       return;
     }
     const requestedSkills = selectedSkillIdsForSend(selectedSkillIds);
     autoScrollPinnedRef.current = true;
     const attachments = await serializeChatAttachments(attachedFiles);
-    if (loading) {
-      await abortSession(activeSessionId);
+    if (chatStreaming) {
+      // 聊天轮流式中再发消息：先停当前聊天轮（不动后台任务）再发送。
+      // 只有后台任务在跑时直接发送，不中止任务。
+      await abortSession(activeSessionId, "chat");
     }
     await sendMessage(activeSessionId, text, {
       activeBookId,
