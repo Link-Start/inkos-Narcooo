@@ -237,6 +237,7 @@ describe("runAgentSession cache — bookId switch", () => {
     evictAgentCache("short-session");
     evictAgentCache("short-confirmed-session");
     evictAgentCache("cover-confirmed-session");
+    evictAgentCache("suppress-session");
     evictAgentCache("play-session");
     evictAgentCache("play-active-session");
     evictAgentCache("play-confirmed-session");
@@ -914,6 +915,48 @@ describe("runAgentSession cache — bookId switch", () => {
     );
 
     expect(agentInstances[0].state.tools.map((tool: any) => tool.name)).toEqual([
+      "sub_agent",
+      "generate_cover",
+      "read",
+      "write_truth_file",
+      "rename_entity",
+      "patch_chapter_text",
+      "replace_chapter_text",
+      "research_web",
+      "ingest_material",
+      "retrieve_material",
+      "import_chapters",
+      "grep",
+      "ls",
+    ]);
+  });
+
+  it("suppresses book-mutating production tools while a background task runs and restores them on flag change", async () => {
+    const model = { provider: "x", id: "y", api: "anthropic-messages" } as any;
+    const pipeline = {} as any;
+
+    // 同会话后台生产任务运行中：host 传 suppressProductionTools，工具表剔除
+    // 会创建/修改书籍与产物的生产工具，只保留读取与资料类工具。
+    await runAgentSession(
+      { sessionId: "suppress-session", bookId: "book-a", language: "zh", pipeline, projectRoot, model, suppressProductionTools: true },
+      "任务在跑吗？",
+    );
+    expect(agentInstances[0].state.tools.map((tool: any) => tool.name)).toEqual([
+      "read",
+      "research_web",
+      "ingest_material",
+      "retrieve_material",
+      "grep",
+      "ls",
+    ]);
+
+    // 任务结束：flag 变化必须让缓存的 Agent 重建，生产工具恢复
+    await runAgentSession(
+      { sessionId: "suppress-session", bookId: "book-a", language: "zh", pipeline, projectRoot, model },
+      "现在呢？",
+    );
+    expect(agentInstances).toHaveLength(2);
+    expect(agentInstances[1].state.tools.map((tool: any) => tool.name)).toEqual([
       "sub_agent",
       "generate_cover",
       "read",

@@ -3485,14 +3485,36 @@ describe("createStudioServer daemon lifecycle", () => {
 
     expect(chatResponse.status).toBe(200);
     const agentCall = runAgentSessionMock.mock.calls.at(-1);
-    const config = agentCall?.[0] as { backgroundTaskContext?: string };
+    const config = agentCall?.[0] as { backgroundTaskContext?: string; suppressProductionTools?: boolean };
     // 任务状态块注入到了 agent 上下文（含任务名和运行状态），用户指令原样传递
     expect(config.backgroundTaskContext).toContain("建书");
     expect(config.backgroundTaskContext).toContain("运行中");
+    // 任务运行期间聊天 agent 的生产工具被 host 侧禁用，提示词同步说明
+    expect(config.backgroundTaskContext).toContain("生产类工具已临时不可用");
+    expect(config.suppressProductionTools).toBe(true);
     expect(agentCall?.[1]).toBe("现在在写吗？");
 
     resolveInitBook();
     await pendingTask;
+
+    // 任务结束后：新一轮聊天不再禁用生产工具，也不再注入任务状态块
+    runAgentSessionMock.mockResolvedValueOnce({ responseText: "任务已经完成。", messages: [] });
+    const afterTask = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "现在还在写吗？",
+        sessionId: "parallel-chat-session",
+        sessionKind: "book-create",
+      }),
+    });
+    expect(afterTask.status).toBe(200);
+    const afterConfig = runAgentSessionMock.mock.calls.at(-1)?.[0] as {
+      backgroundTaskContext?: string;
+      suppressProductionTools?: boolean;
+    };
+    expect(afterConfig.backgroundTaskContext).toBeUndefined();
+    expect(afterConfig.suppressProductionTools).toBeFalsy();
   });
 
   it("tags task pipeline log broadcasts with the execution id while chat round logs stay untagged", async () => {

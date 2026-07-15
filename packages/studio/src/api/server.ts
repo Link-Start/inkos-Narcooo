@@ -249,7 +249,7 @@ function buildRunningTaskContextBlock(task: StudioTaskSnapshot, lang: StudioLang
       `- 任务：${exec.label}（${exec.tool}）`,
       `- 状态：${status}`,
       `- 已运行：${elapsed}${logsBlock}`,
-      "该任务在后台独立运行，本轮对话不会打断它。用户询问任务进展时，基于以上信息如实回答。不要再次发起同类生产任务，也不要声称没有任务在运行。",
+      "该任务在后台独立运行，本轮对话不会打断它。用户询问任务进展时，基于以上信息如实回答。不要再次发起同类生产任务，也不要声称没有任务在运行。生产类工具已临时不可用，任务结束后恢复。",
     ].join("\n"),
     [
       "## Background task status",
@@ -257,7 +257,7 @@ function buildRunningTaskContextBlock(task: StudioTaskSnapshot, lang: StudioLang
       `- Task: ${exec.label} (${exec.tool})`,
       `- Status: ${status}`,
       `- Elapsed: ${elapsed}${logsBlock}`,
-      "The task runs independently in the background; this chat turn does not interrupt it. When the user asks about its progress, answer truthfully from the information above. Do not start another production task of the same kind, and do not claim that no task is running.",
+      "The task runs independently in the background; this chat turn does not interrupt it. When the user asks about its progress, answer truthfully from the information above. Do not start another production task of the same kind, and do not claim that no task is running. Production tools are temporarily unavailable and will be restored when the task finishes.",
     ].join("\n"),
   );
 }
@@ -4881,7 +4881,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       // a Chinese play world, because play_start then infers from the rewritten premise.
       // Run pi-agent session
       // 后台生产任务与聊天并行时，把任务状态注入 agent 的系统提示词，
-      // 让模型知道任务仍在运行、能回答进度、且不会重复发起同类任务。
+      // 让模型知道任务仍在运行、能回答进度、且不会重复发起同类任务；
+      // 同时传 suppressProductionTools 在 host 层剔除会修改书籍/产物的
+      // 生产工具（提示词只是软约束）。
       const backgroundTask = await findActiveRunningTask(bookSession.sessionId);
       const collectedToolExecs: CollectedToolExec[] = [];
       const result = await runAgentSession(
@@ -4890,7 +4892,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           apiKey: agentApiKey,
           pipeline,
           ...(backgroundTask
-            ? { backgroundTaskContext: buildRunningTaskContextBlock(backgroundTask, surfaceLanguage) }
+            ? {
+                backgroundTaskContext: buildRunningTaskContextBlock(backgroundTask, surfaceLanguage),
+                suppressProductionTools: true,
+              }
             : {}),
           projectRoot: root,
           bookId: agentBookId,
