@@ -47,3 +47,8 @@ export {
   createFilmAuthoringTools,
   type FilmLLMDeps,
 } from "./film-authoring-tools.js";
+export {
+  createNarrativeForecastCreateTool,
+  createNarrativeForecastGetTool,
+  createNarrativeForecastSelectTool,
+} from "./forecast-tools.js";

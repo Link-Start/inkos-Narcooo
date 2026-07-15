@@ -43,6 +43,11 @@ import {
   createImportChaptersTool,
 } from "./agent-tools.js";
 import { createFilmAuthoringTools, filmLLMDepsFromClient } from "./film-authoring-tools.js";
+import {
+  createNarrativeForecastCreateTool,
+  createNarrativeForecastGetTool,
+  createNarrativeForecastSelectTool,
+} from "./forecast-tools.js";
 import { createBookContextTransform } from "./context-transform.js";
 import {
   appendTranscriptEvents,
@@ -902,12 +907,25 @@ function createAgentToolsForMode(params: {
     materialTool,
     materialRetrievalTool,
     importChaptersTool,
+    createNarrativeForecastCreateTool(params.pipeline, params.bookId, params.projectRoot),
+    createNarrativeForecastGetTool(params.bookId, params.projectRoot),
+    createNarrativeForecastSelectTool(params.bookId, params.projectRoot),
     createGrepTool(params.projectRoot),
     createLsTool(params.projectRoot),
   ];
 
   if (params.sessionKind === "edit") {
-    return bookTools.filter((tool) => !["sub_agent", "generate_cover", "research_web", "import_chapters"].includes(tool.name));
+    // Edit mode stays deterministic: forecast create runs an LLM projection,
+    // and get/select belong to the planning workflow, not text editing.
+    return bookTools.filter((tool) => ![
+      "sub_agent",
+      "generate_cover",
+      "research_web",
+      "import_chapters",
+      "create_narrative_forecast",
+      "get_narrative_forecast",
+      "select_narrative_branch",
+    ].includes(tool.name));
   }
 
   return bookTools;
