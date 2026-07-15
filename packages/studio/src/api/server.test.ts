@@ -3186,6 +3186,68 @@ describe("createStudioServer daemon lifecycle", () => {
     });
   });
 
+  it("lets exactly one of two concurrent confirmed requests start and rejects the other with 409", async () => {
+    // 单任务检查曾是"await 读快照 → 之后才 set controller"的 check-then-act：
+    // 两个并发确认请求都能通过检查，双任务同时启动。用 loadBookSession 做
+    // 屏障，让两个请求同时到达检查窗口，验证名额是同步预留的。
+    const sessionRecord = {
+      sessionId: "race-task-session",
+      bookId: null,
+      sessionKind: "book-create",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    let arrived = 0;
+    let releaseBarrier!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    loadBookSessionMock.mockImplementation(async () => {
+      arrived += 1;
+      if (arrived === 2) releaseBarrier();
+      await barrier;
+      return sessionRecord;
+    });
+    // 任务本体拖一拍，保证第二个请求做检查时第一个任务还在运行中
+    initBookMock.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const request = (title: string) => app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: `创建《${title}》。`,
+        sessionId: "race-task-session",
+        sessionKind: "book-create",
+        actionSource: "button",
+        requestedIntent: "create_book",
+        actionPayload: { createBook: { title, language: "zh" } },
+      }),
+    });
+
+    const responses = await Promise.all([request("并发一"), request("并发二")]);
+
+    const statuses = responses.map((response) => response.status).sort();
+    expect(statuses).toEqual([200, 409]);
+    const rejected = responses.find((response) => response.status === 409)!;
+    await expect(rejected.json()).resolves.toMatchObject({
+      error: { code: "PRODUCTION_TASK_ALREADY_RUNNING" },
+    });
+    // 败者的任务没有真正启动
+    expect(initBookMock).toHaveBeenCalledTimes(1);
+    // 胜者的任务不受影响，快照收敛为 completed
+    await expect(loadStudioTaskSnapshot(root, "race-task-session")).resolves.toMatchObject({
+      execution: { status: "completed" },
+    });
+  });
+
   it("tells the chat agent about the running production task without touching the user instruction", async () => {
     let resolveInitBook!: () => void;
     initBookMock.mockImplementationOnce(() => new Promise<void>((resolve) => {

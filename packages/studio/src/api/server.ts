@@ -2619,6 +2619,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   const state = new StateManager(root);
   let cachedConfig = initialConfig;
   const activeConfirmedTasks = new Map<string, AbortController>();
+  // 确认式生产任务的单任务名额（sessionId 集合）。原来的检查是"await 读快照
+  // → 之后才 set controller"的 check-then-act：两个并发确认请求都能通过检查，
+  // 双任务同时启动、快照互相覆盖。这里在任何 await 之前同步占位，占位失败的
+  // 请求直接 409；任务结束（成功/失败）后在 finally 释放。
+  const reservedProductionSessions = new Set<string>();
   // 已删除会话的 sessionId：删除会话时中止其生产任务，任务随后的错误持久化
   // 不能把快照文件重新写回来（给已删除的会话"还魂"）。同名会话重新创建时移除标记。
   const deletedSessionIds = new Set<string>();
@@ -4674,10 +4679,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           : undefined;
 
       if (confirmedIntent) {
-        // task-store 每会话只有一个任务快照，不支持并发生产任务：
-        // 已有任务在跑时明确拒绝，而不是覆盖旧快照导致前端丢失运行中的任务卡。
-        const runningTask = await findActiveRunningTask(bookSession.sessionId);
-        if (runningTask) {
+        const productionTaskBusyResponse = () => {
           const message = pick(
             surfaceLanguage,
             "当前会话已有一个生产任务在运行，请等它完成，或先用停止按钮结束它，再发起新任务。",
@@ -4687,24 +4689,44 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             error: { code: "PRODUCTION_TASK_ALREADY_RUNNING", message },
             response: message,
           }, 409);
-        }
+        };
 
-        const pendingBookId = confirmedIntent === "create_book" && actionPayload?.createBook?.title
-          ? deriveBookIdFromTitle(actionPayload.createBook.title)
-          : null;
-        if (pendingBookId) {
-          bookCreateStatus.set(pendingBookId, { status: "creating" });
-          broadcast("book:creating", {
-            bookId: pendingBookId,
-            title: actionPayload?.createBook?.title ?? pendingBookId,
-            sessionId: streamSessionId,
-          });
+        // task-store 每会话只有一个任务快照，不支持并发生产任务。
+        // 名额必须在任何 await 之前同步预留：并发的第二个确认请求在这里 409，
+        // 不会与第一个请求一起通过后面的快照检查（check-then-act 竞态）。
+        // 预留键固定为此刻的 sessionId：后面 bookSession 可能因建书迁移被重新
+        // 赋值，finally 释放的必须是当初预留的那个键。
+        const reservedSessionId = bookSession.sessionId;
+        if (reservedProductionSessions.has(reservedSessionId)) {
+          return productionTaskBusyResponse();
         }
+        reservedProductionSessions.add(reservedSessionId);
 
         const taskId = `direct-${confirmedIntent}-${randomUUID()}`;
         const taskController = new AbortController();
         activeConfirmedTasks.set(taskId, taskController);
+        let pendingBookId: string | null = null;
         try {
+          // 预留成功后再走快照检查：本进程的任务都会占预留名额，这里防的是
+          // 旧进程遗留的运行中快照（loadReconciledTaskSnapshot 会把它对账成
+          // 终态）等边界情况，保证不覆盖一个仍被认为在运行的任务。
+          const runningTask = await findActiveRunningTask(bookSession.sessionId);
+          if (runningTask) {
+            return productionTaskBusyResponse();
+          }
+
+          pendingBookId = confirmedIntent === "create_book" && actionPayload?.createBook?.title
+            ? deriveBookIdFromTitle(actionPayload.createBook.title)
+            : null;
+          if (pendingBookId) {
+            bookCreateStatus.set(pendingBookId, { status: "creating" });
+            broadcast("book:creating", {
+              bookId: pendingBookId,
+              title: actionPayload?.createBook?.title ?? pendingBookId,
+              sessionId: streamSessionId,
+            });
+          }
+
           const exec = await executeConfirmedProductionAction({
             pipeline,
             root,
@@ -4791,6 +4813,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           }, failure.status);
         } finally {
           activeConfirmedTasks.delete(taskId);
+          reservedProductionSessions.delete(reservedSessionId);
         }
       }
 
