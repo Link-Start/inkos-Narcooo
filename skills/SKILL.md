@@ -29,6 +29,7 @@ Treat InkOS as a confirmable action system, not a bag of prompt shortcuts.
 - Use the translation project workflow for EPUB, text-based PDF, TXT, or Markdown localization. Keep source and target languages, glossary, review report, and export format explicit; do not replace it with an ad hoc one-turn translation when the user wants a complete deliverable.
 - Use `research_web` only when the user explicitly asks for external facts, market references, era/profession details, or worldbuilding research. Research reports are reference material and do not automatically mutate canon or prose.
 - Use long-form chapter tools only for existing long-form books.
+- Use narrative forecasts when the author wants to compare possible long-form directions before writing. A forecast is non-canonical planning material: selecting a branch may write `selected-branch-plan.md`, but it must not be described as changing prose, outlines, or canonical state.
 - Runtime skills provide professional rules, prompt packs, and context requirements. They do not grant new file, network, image, or writing permissions by themselves.
 - Context is governed: protected facts and current intent should not be silently compressed away; compressible history may be summarized when the context budget is tight.
 - Studio Chat can receive user-uploaded text / Markdown / image attachments. Text attachments are injected into the LLM context; image attachments require a vision-capable model.
@@ -206,6 +207,23 @@ Recommended orchestration:
 - `compose_chapter`
 - inspect the resulting intent/paths
 - `write_draft` or `write_full_pipeline`
+
+### Workflow 2.7: Compare Long-Form Directions Before Writing
+
+Use a narrative forecast when the author wants to inspect several plausible futures without committing any of them to canon.
+
+1. Create isolated candidates from the current book state:
+   ```bash
+   inkos forecast create book-id --divergence "Does the protagonist reveal the evidence now?" --branches 3 --horizon 5
+   ```
+2. Compare the branch cards in Studio Chat, or inspect the saved comparison with `inkos forecast show [book-id] <forecast-id>`.
+3. Re-check the forecast before relying on it. Canon changes mark the forecast stale.
+4. Select one candidate with the Studio card or:
+   ```bash
+   inkos forecast select book-id forecast-id branch-2
+   ```
+
+Selection writes only `story/runtime/narrative-forecasts/<forecast-id>/selected-branch-plan.md`. It does not apply the plan to chapter prose, outlines, author intent, or canonical state. Any later application remains a separate explicit authoring action.
 
 ### Workflow 3: Import Existing Chapters & Continue
 
@@ -707,6 +725,7 @@ inkos genre copy xuanhuan
 | `inkos plan chapter [book-id]` | Generate chapter intent | Preview what next chapter will do before writing |
 | `inkos compose chapter [book-id]` | Generate runtime artifacts | Context, rule-stack, trace for next chapter |
 | `inkos consolidate [book-id]` | Consolidate chapter summaries | Reduces context for long books (volume-level summaries) |
+| `inkos forecast create/show/select` | Compare non-canonical future branches | Selection saves a candidate plan only; canon remains unchanged |
 | `inkos eval [book-id]` | Quality evaluation report | `--json`, `--chapters <range>`. Composite quality score |
 | `inkos` / `inkos studio` | Start web workbench | `-p` for port. Local web UI for book management |
 | `inkos fanfic show [book-id]` | Display parsed fanfic canon | Shows imported source material analysis |
