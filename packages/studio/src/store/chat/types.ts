@@ -32,6 +32,9 @@ export interface ToolExecution {
   logs?: string[];
   startedAt: number;
   completedAt?: number;
+  // 后台生产任务的工具卡（来自带 background 标记的 tool:start 或任务快照恢复）。
+  // 无 executionId 事件的回退路由据此跳过任务卡，只挂聊天轮工具卡。
+  background?: boolean;
 }
 
 // -- Message parts (chronologically ordered for rendering) --

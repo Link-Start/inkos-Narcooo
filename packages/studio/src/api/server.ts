@@ -1653,12 +1653,16 @@ async function executeConfirmedProductionAction(args: {
 
   await args.onTaskChange(exec);
 
+  // background: true 标明这是后台生产任务的工具启动（聊天轮工具不带）。
+  // free-text 命中写章启发式时前端在发送时无法预知这轮会按任务执行，
+  // 收到这个标记后把该轮从聊天轮重分类为任务轮。
   broadcast("tool:start", {
     sessionId: args.streamSessionId,
     id,
     tool: tool.name,
     args: params,
     stages: exec.stages?.map(stage => stage.label),
+    background: true,
   });
 
   try {

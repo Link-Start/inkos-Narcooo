@@ -234,8 +234,13 @@ export function deserializeMessages(
 
 export function mergeTaskExecution(
   messages: ReadonlyArray<Message>,
-  execution: ToolExecution,
+  taskExecution: ToolExecution,
 ): ReadonlyArray<Message> {
+  // 任务快照必然来自后台生产任务：恢复出的卡带 background 标记，供无 id
+  // 事件的回退路由跳过它。终态快照替换整个 execution，标记也要跟着补回来。
+  const execution: ToolExecution = taskExecution.background
+    ? taskExecution
+    : { ...taskExecution, background: true };
   let found = false;
   const next = messages.map((message) => {
     const hasDirectExecution = message.toolExecutions?.some((item) => item.id === execution.id) ?? false;

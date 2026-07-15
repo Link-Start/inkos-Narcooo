@@ -231,7 +231,7 @@ describe("withToolExecutions", () => {
 });
 
 describe("mergeTaskExecution", () => {
-  it("adds a persisted running task as a restorable tool card", () => {
+  it("adds a persisted running task as a background-tagged restorable tool card", () => {
     const execution = exec({
       id: "short-task-1",
       tool: "short_fiction_run",
@@ -242,12 +242,15 @@ describe("mergeTaskExecution", () => {
 
     const messages = mergeTaskExecution([], execution);
 
+    // 任务快照必然来自后台生产任务：恢复出的卡带 background 标记，
+    // 供无 id 事件的回退路由跳过它。
+    const tagged = { ...execution, background: true };
     expect(messages).toEqual([
       expect.objectContaining({
         role: "assistant",
         timestamp: 10,
-        toolExecutions: [execution],
-        parts: [{ type: "tool", execution }],
+        toolExecutions: [tagged],
+        parts: [{ type: "tool", execution: tagged }],
       }),
     ]);
   });
@@ -265,9 +268,11 @@ describe("mergeTaskExecution", () => {
 
     const messages = mergeTaskExecution(mergeTaskExecution([], running), completed);
 
+    // 终态快照替换整个 execution 时不能丢 background 标记
+    const tagged = { ...completed, background: true };
     expect(messages).toHaveLength(1);
-    expect(messages[0]?.toolExecutions).toEqual([completed]);
-    expect(messages[0]?.parts).toEqual([{ type: "tool", execution: completed }]);
+    expect(messages[0]?.toolExecutions).toEqual([tagged]);
+    expect(messages[0]?.parts).toEqual([{ type: "tool", execution: tagged }]);
   });
 });
 

@@ -426,6 +426,13 @@ export function attachSessionStreamListeners({
     try {
       const data = event.data ? JSON.parse(event.data) : null;
       if (!sessionMatchesEvent(sessionId, data) || !data?.tool) return;
+      // 服务端在确认式生产任务的 tool:start 上带 background: true。free-text
+      // 命中服务端写章启发式时，前端发送时把这轮当成了聊天轮
+      //（isChatStreaming=true）；收到该标记说明这轮实际按后台任务执行，
+      // 需要重分类：isChatStreaming 归 false（停止按钮据此走 scope=all 才能
+      // 拿到任务控制器，用户也可以继续聊天），isStreaming 维持 true（任务在跑）。
+      // 挂起的 fetch 返回后由 sendMessage 的 finally 按"是否还有任务在跑"收尾。
+      const background = data.background === true;
       flushTextDeltas();
       set((state) => ({
         sessions: updateSession(state.sessions, sessionId, (runtime) => {
@@ -464,11 +471,15 @@ export function attachSessionStreamListeners({
               args: data.args as Record<string, unknown> | undefined,
               stages,
               startedAt: Date.now(),
+              ...(background ? { background: true } : {}),
             },
           });
 
           const flat = deriveFlat(parts);
-          return { messages: replaceLast(messages, { ...stream, ...flat, parts }) };
+          return {
+            messages: replaceLast(messages, { ...stream, ...flat, parts }),
+            ...(background && runtime.isChatStreaming ? { isChatStreaming: false } : {}),
+          };
         }),
       }));
     } catch {

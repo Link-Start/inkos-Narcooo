@@ -3644,6 +3644,97 @@ describe("createStudioServer daemon lifecycle", () => {
     await ssePump;
   }, 60_000);
 
+  it("marks confirmed production tool:start broadcasts as background while chat tool starts stay untagged", async () => {
+    loadBookSessionMock.mockResolvedValue({
+      sessionId: "bg-flag-session",
+      bookId: null,
+      sessionKind: "short",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const sseResponse = await app.request("http://localhost/api/v1/events");
+    const sseEvents: Array<{ event: string; data: Record<string, unknown> | null }> = [];
+    const sseReader = sseResponse.body!.getReader();
+    const ssePump = (async () => {
+      const decoder = new TextDecoder();
+      let buffer = "";
+      try {
+        for (;;) {
+          const { done, value } = await sseReader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let frameEnd = buffer.indexOf("\n\n");
+          while (frameEnd !== -1) {
+            const lines = buffer.slice(0, frameEnd).split("\n");
+            buffer = buffer.slice(frameEnd + 2);
+            const eventName = lines.find((line) => line.startsWith("event:"))?.slice("event:".length).trim();
+            const dataRaw = lines.find((line) => line.startsWith("data:"))?.slice("data:".length).trim();
+            if (eventName) {
+              sseEvents.push({ event: eventName, data: dataRaw ? JSON.parse(dataRaw) as Record<string, unknown> : null });
+            }
+            frameEnd = buffer.indexOf("\n\n");
+          }
+        }
+      } catch {
+        // abort 断开 SSE 连接时 read 会抛错，这是本测试收尾的正常关闭路径
+      }
+    })();
+    await vi.waitFor(() => expect(sseEvents.some((entry) => entry.event === "ping")).toBe(true));
+
+    // 确认式生产任务分支：tool:start 必须带 background 标记，前端据此把
+    // free-text 命中任务分支的聊天轮重分类为任务轮。
+    const taskResponse = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "写一篇冷库账本短篇。",
+        sessionId: "bg-flag-session",
+        sessionKind: "short",
+        actionSource: "button",
+        requestedIntent: "short_run",
+        actionPayload: { shortRun: { direction: "冷库账本悬疑", cover: false } },
+      }),
+    });
+    expect(taskResponse.status).toBe(200);
+    const findToolStart = (predicate: (data: Record<string, unknown>) => boolean) =>
+      sseEvents.find((entry) => entry.event === "tool:start" && entry.data !== null && predicate(entry.data));
+    await vi.waitFor(() => {
+      expect(findToolStart((data) => String(data.id ?? "").startsWith("direct-short_run-"))).toBeDefined();
+    });
+    expect(findToolStart((data) => String(data.id ?? "").startsWith("direct-short_run-"))?.data).toMatchObject({
+      sessionId: "bg-flag-session",
+      background: true,
+    });
+
+    // 聊天轮工具的 tool:start 不带 background 标记，前端维持聊天轮分类。
+    runAgentSessionMock.mockImplementationOnce(async (config: { onEvent?: (event: unknown) => void }) => {
+      config.onEvent?.({ type: "tool_execution_start", toolCallId: "chat-tool-1", toolName: "read", args: {} });
+      return { responseText: "读完了。", messages: [] };
+    });
+    const chatResponse = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "帮我读一下大纲。",
+        sessionId: "bg-flag-session",
+        sessionKind: "short",
+      }),
+    });
+    expect(chatResponse.status).toBe(200);
+    await vi.waitFor(() => expect(findToolStart((data) => data.id === "chat-tool-1")).toBeDefined());
+    expect(findToolStart((data) => data.id === "chat-tool-1")?.data?.background).toBeUndefined();
+
+    await sseReader.cancel();
+    await ssePump;
+  });
+
   it("aborts only the chat round when scope=chat and leaves the production task controller alive", async () => {
     let resolveRun!: () => void;
     let capturedSignal: AbortSignal | undefined;

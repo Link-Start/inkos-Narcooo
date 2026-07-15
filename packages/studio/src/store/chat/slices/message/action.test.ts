@@ -742,6 +742,63 @@ describe("chat message actions", () => {
     await sent;
   });
 
+  it("reclassifies a free-text turn as a production task when the server starts a background task", async () => {
+    const store = createTestStore();
+    const sessionId = store.getState().createDraftSession("demo-book", "book");
+    store.getState().setSelectedModel("deepseek-v4-flash", "kkaiapi");
+
+    let resolveAgent!: (value: unknown) => void;
+    fetchJson
+      .mockResolvedValueOnce({ session: { sessionId, bookId: "demo-book", sessionKind: "book" } })
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveAgent = resolve;
+      }));
+
+    // free-text 发送：前端无法预知服务端会命中写章启发式，先按聊天轮对待
+    const sent = store.getState().sendMessage(sessionId, "写下一章");
+    await vi.waitFor(() => expect(fakeEventSources).toHaveLength(1));
+    expect(store.getState().sessions[sessionId]).toMatchObject({ isStreaming: true, isChatStreaming: true });
+
+    // 普通聊天轮工具启动（不带 background 标记）不改变轮次分类
+    fakeEventSources[0]?.emit("tool:start", { sessionId, id: "chat-tool-0", tool: "read" });
+    expect(store.getState().sessions[sessionId]).toMatchObject({ isChatStreaming: true });
+    fakeEventSources[0]?.emit("tool:end", { sessionId, id: "chat-tool-0", tool: "read", result: "ok" });
+
+    // 服务端广播带 background 标记的 tool:start：这轮实际按后台生产任务执行
+    fakeEventSources[0]?.emit("tool:start", {
+      sessionId,
+      id: "direct-write_next-1",
+      tool: "sub_agent",
+      args: { agent: "writer", bookId: "demo-book" },
+      background: true,
+    });
+
+    // 重分类：isChatStreaming 归 false（停止按钮据此走 scope=all，能拿到任务控制器），
+    // isStreaming 维持 true（任务还在跑），工具卡带上 background 标记
+    expect(store.getState().sessions[sessionId]).toMatchObject({ isStreaming: true, isChatStreaming: false });
+    const taskExecution = (store.getState().sessions[sessionId]?.messages ?? [])
+      .flatMap((message) => message.toolExecutions ?? [])
+      .find((execution) => execution.id === "direct-write_next-1");
+    expect(taskExecution).toMatchObject({ status: "running", background: true });
+
+    // 任务结束：tool:end 收尾任务卡，挂起的 fetch 返回后 finally 正常收尾（不重复、不残留）
+    fakeEventSources[0]?.emit("tool:end", {
+      sessionId,
+      id: "direct-write_next-1",
+      tool: "sub_agent",
+      result: { content: [{ type: "text", text: "第 3 章已完成" }] },
+    });
+    resolveAgent({ response: "", session: { sessionId, sessionKind: "book" } });
+    await sent;
+
+    expect(store.getState().sessions[sessionId]).toMatchObject({
+      isStreaming: false,
+      isChatStreaming: false,
+      stream: null,
+    });
+    expect(fakeEventSources[0]?.closed).toBe(true);
+  });
+
   it("routes executionId-tagged llm progress to the task card's active stage", async () => {
     const store = createTestStore();
     const sessionId = await setupRunningTaskSession(store);
