@@ -13,14 +13,13 @@
   <a href="https://clawhub.ai/narcooo/inkos"><img src="https://img.shields.io/badge/🦞%20ClawHub-Skill-FF6B35?labelColor=1a1a1a" alt="ClawHub Skill"></a>
 </p>
 
-<p align="left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://kimi-file.moonshot.cn/prod-chat-kimi/kfs/4/1/2026-06-05/1d8h69mt3v89kkekg24gg">
-    <img alt="Kimi Open Source Friends" width="420" src="https://kimi-file.moonshot.cn/prod-chat-kimi/kfs/4/1/2026-06-05/1d8h69fudcmosb3pipls0">
-  </picture>
-  <br>
-  🎉🎉 InkOS 入选首批 KIMI 开源合作伙伴 🎉🎉
+<p align="center">
+  <a href="https://platform.moonshot.cn/"><img src="https://gcdn.moonshot.cn/growth-cdn/sponsor/kimi-zh.png" width="900" alt="Kimi 赞助 InkOS"></a>
 </p>
+
+感谢 Kimi 赞助本项目！Kimi K2.7 是 Moonshot AI 推出的开源智能体模型。搭配 InkOS，Kimi 可以参与长短篇小说、剧本、互动影游与多语言内容的规划、写作、审稿和修订；InkOS 则持续管理角色、设定、伏笔与故事状态，让长篇创作更连贯、更可控。
+
+InkOS Studio 已支持 Moonshot（Kimi）。前往 Kimi 开放平台（[中文站](https://platform.moonshot.cn/)｜[Global](https://platform.moonshot.ai/)）获取 API Key，即可开始创作。
 
 <p align="center">
   <a href="README.en.md">English</a> | 中文 | <a href="README.ja.md">日本語</a>

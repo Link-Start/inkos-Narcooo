@@ -14,11 +14,12 @@
 </p>
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://kimi-file.moonshot.cn/prod-chat-kimi/kfs/4/1/2026-06-05/1d8h69mt3v89kkekg24gg">
-    <img alt="Kimi Open Source Friends" width="760" src="https://kimi-file.moonshot.cn/prod-chat-kimi/kfs/4/1/2026-06-05/1d8h69fudcmosb3pipls0">
-  </picture>
+  <a href="https://platform.moonshot.ai/"><img src="https://gcdn.moonshot.cn/growth-cdn/sponsor/kimi-en.png" width="900" alt="Kimi sponsors InkOS"></a>
 </p>
+
+Thanks to Kimi for sponsoring this project! Kimi K2.7 is an open-source agentic model developed by Moonshot AI. With InkOS, Kimi can assist with planning, drafting, reviewing, and revising novels, scripts, interactive stories, and multilingual content, while InkOS manages characters, worldbuilding, plot threads, and persistent story state to keep long-form creation coherent and controllable.
+
+InkOS Studio already supports Moonshot (Kimi). Get an API key from the Kimi Open Platform ([中文站](https://platform.moonshot.cn/) | [Global](https://platform.moonshot.ai/)) and start creating.
 
 <p align="center">
   <a href="README.md">中文</a> | English | <a href="README.ja.md">日本語</a>
