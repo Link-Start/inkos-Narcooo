@@ -38,28 +38,19 @@ InkOS Studio already supports Moonshot (Kimi). Get an API key from the Kimi Open
 
 > 💡 **One key for global frontier models** — pair InkOS with [**kkaiapi**](https://en.kkaiapi.com/): an OpenAI-compatible gateway for Claude, GPT, Gemini, DeepSeek, Kimi, Qwen, GLM, and image models. Add it as a custom service with base URL `https://api.kkaiapi.com/v1`, then switch models in Studio without juggling multiple provider accounts.
 
-## v1.7.1 Narrative Forecasts and Non-Blocking Studio Collaboration
+## v1.7 Multilingual Creation, Narrative Forecasts, and Non-Blocking Collaboration
 
-InkOS 1.7.1 lets long-form authors compare possible futures before committing to the next chapter. Studio Chat generates isolated candidate branches from current canon and compares their chapter beats, character decisions, projected changes, risks, and author-intent alignment. Selecting a branch saves a candidate plan only; it does not pre-emptively modify prose, outlines, or story state.
+InkOS 1.7 brings cross-language delivery, long-form forecasting, and continuous collaboration into the same Agent workbench. Translate complete works, compare several non-canonical futures, keep chatting while production runs in the background, or ask Chat to read references, import an existing manuscript, adjust prompts, revise chapters, and safely recover the creative state.
 
-- **Narrative forecasts**: create, re-check, and select 2-5 non-canonical futures from Studio Chat or the CLI. Forecasts become stale when canon changes.
-- **Keep chatting while InkOS writes**: chapter production runs in the background instead of occupying the whole conversation, with progress and terminal state restored after refresh.
-- **More reliable task recovery**: retry failed messages, abort production when its session is deleted, clean up zombie task snapshots after restart, and prevent stale task or Play state from reviving.
-- **Safer creative data**: whole-book backup / restore, latest-chapter deletion with state rollback, and synchronized chapter-index word counts after patch edits.
-- **Traceable tool results**: direct terminal tool calls restore as complete cards after refresh, while completion remains grounded in actual tool results and files.
-
-## v1.7.0 Multilingual Translation, Cross-Language Creation, and Long-Task Reliability
-
-InkOS 1.7.0 connects creation, collaboration, source reading, revision, and cross-language delivery through the same Agent workbench. Import EPUB, text-based PDF, TXT, or Markdown; choose source and target languages in plain language; then translate by chapter, maintain terminology, review source and translation side by side, and export the complete result. Studio Chat also continues to support attachments, existing-novel import, prompt editing, chapter revision, and abortable long-running tasks.
-
-- **Complete translation workbench**: import EPUB, text-based PDF, TXT, and Markdown; translate by chapter and semantic segment; maintain a glossary, generate review reports, and export TXT, Markdown, or EPUB.
-- **Translation across Studio, Chat, and CLI**: create, run, inspect, review, and export translation projects in Studio; start one from a confirmed Chat action; or use `inkos translate init / run / export` in the CLI.
-- **Cross-language creation**: short fiction, scripts, storyboards, and interactive-film pipelines now have English-native prompt paths. Studio's dynamic copy and CLI language fallback were expanded with them, rather than merely translating menus.
-- **Attachments, material library, and editable prompts**: Chat can read text, Markdown, and images; external references can be archived and retrieved with evidence traces; long-form, Play, and interactive-film prompt packs can be inspected and adjusted in Studio.
-- **Existing novels become real projects**: Chat can import chapters from local files, directories, or attachments, reverse-engineer foundation files, and replay chapter state instead of treating the manuscript as temporary context.
+- **Narrative forecasts**: Studio Chat and the CLI can create, re-check, and select 2-5 isolated futures from current canon, comparing chapter beats, character decisions, projected changes, risks, and author-intent alignment. Selecting one saves a plan only; it does not pre-emptively alter prose, foundations, or story state.
+- **Complete translation workbench**: import EPUB, text-based PDF, TXT, and Markdown; translate by chapter and semantic segment; maintain a glossary, generate side-by-side review reports, and export TXT, Markdown, or EPUB. Studio, Chat, and `inkos translate init / run / export` share the same capability.
+- **Native cross-language creation**: short fiction, scripts, storyboards, and interactive-film pipelines now include English-native prompt paths, with matching Studio copy and CLI language fallback rather than a translation-only menu.
+- **Attachments, material library, and editable prompts**: Chat can read text, Markdown, and images; archive and retrieve external references with evidence traces; and inspect or adjust long-form, Play, and interactive-film prompt packs in Studio.
+- **Existing works become real projects**: import chapters from local files, directories, or attachments, reverse-engineer foundation files, and replay chapter state instead of treating a manuscript as temporary context.
+- **Keep chatting while InkOS writes**: production runs in the background while conversation remains available. Tasks can be aborted, failed messages retried, and accurate progress, terminal state, and complete tool cards restored after refresh or restart.
 - **Controllable review, revision, and continuous writing**: strict, lenient, and always revision gates support project- and book-level overrides, with automatic or manual review per book. The CLI adds `inkos auto` and completion/failure notifications, while rejected revisions show before/after metrics and unresolved issues.
-- **Abortable tasks and recoverable write locks**: stop signals propagate through the Agent, writing pipeline, and model request. Locks left by abnormal exits recover automatically, while real concurrent conflicts return `BOOK_BUSY`.
-- **More reliable models, installation, and cross-platform behavior**: MiniMax thinking no longer leaks into prose; dynamic services such as OpenRouter and kkaiapi are no longer blocked by a static model list; npm packages no longer leak `workspace:*` dependencies; action details, notifications, and project paths are more consistent across platforms.
+- **Safer creative data and concurrency**: whole-book backup / restore, latest-chapter deletion with state rollback, and synchronized chapter-index counts after patch edits. Stale locks recover, concurrent writes return `BOOK_BUSY`, and completion is grounded only in actual tool results and files.
+- **More reliable models, installation, and cross-platform behavior**: the built-in MiniMax integration separates reasoning from prose by default; dynamic services such as OpenRouter and kkaiapi are not blocked by a static model list; npm packages no longer leak `workspace:*` dependencies; action details, notifications, and project paths are more consistent across platforms.
 
 ## v1.6.0 Major Update
 
